@@ -1,24 +1,33 @@
 #!/usr/bin/env python3
 """
-Synthetic Power Grid Generator - CIM XML Output
+Synthetic Power Grid Generator - CIM / CGMES output
 
 Generates a synthetic two-level transmission grid with German / European (ENTSO-E)
-default parameters and exports CIM RDF/XML (CIM17 / CIM100 namespace) using
-cim-graph. The file is verified by reading it back and solving an AC power flow
-on the read-back model.
+default parameters and exports it as
+  * CIM17 RDF/XML (CIM100 namespace, typed SI units) through cim-graph, and
+  * CGMES 2.4.15 (EQ, TP, SSH, SV, GL, DL profiles in one zip),
+both with geographic coordinates (GL) and a schematic diagram layout (DL), so the
+grid can be drawn by map- and diagram-based viewers. The SV profile holds the
+solved AC power flow. Both outputs are verified: the CIM17 file is read back with
+cim-graph and solved with pandapower; the CGMES zip is imported and solved with
+PowSyBl (pypowsybl), the reference open-source CGMES importer.
 
 Usage:
-    python synthetic_cim_generator.py --buses 40 --gens 8 --loads 30 --seed 42 --output grid.cim.xml
-    python synthetic_cim_generator.py --buses 12 --backbone-buses 0      # single 110 kV level
+    python synthetic_cim_generator.py                       # 40 substations, 380/110 kV
+    python synthetic_cim_generator.py --buses 200 --gens 30 --loads 150 --seed 7
+    python synthetic_cim_generator.py --buses 12 --backbone-buses 0 --format cim17
 
 Model contents:
     GeographicalRegion -> SubGeographicalRegion -> Substation (one per 110 kV site)
         -> VoltageLevel (110 kV, plus 380 kV at backbone sites)
             -> ConnectivityNode, SynchronousMachine, EnergyConsumer, LinearShuntCompensator
         -> PowerTransformer (380/110 kV) -> PowerTransformerEnd x2
-    SubGeographicalRegion -> Line -> ACLineSegment
-    SynchronousMachine -> GeneratingUnit (P limits), RegulatingControl (voltage setpoint)
+    SubGeographicalRegion -> Line -> ACLineSegment (one per circuit)
+    SynchronousMachine -> ThermalGeneratingUnit (P limits), RegulatingControl (voltage setpoint)
     Terminal -> OperationalLimitSet -> CurrentLimit (PATL thermal rating)
+    TP: TopologicalNode per ConnectivityNode; SV: SvVoltage, SvPowerFlow, TopologicalIsland
+    GL: Location + PositionPoint (WGS84) for substations and line routes
+    DL: Diagram with DiagramObjects for buses, lines, transformers, machines, loads, shunts
 
 Network design:
     * 110 kV regional grid: random substation sites, minimum spanning tree plus
@@ -28,53 +37,45 @@ Network design:
       two per site for N-1, more if the site's supply area needs it).
     * Large units connect to 380 kV, smaller units to 110 kV; loads are at 110 kV.
       Dispatch equals load plus a loss allowance, shared in proportion to capacity.
+    * DC-power-flow reinforcement adds parallel circuits / transformers until no
+      branch exceeds 70 % of its rating.
     * Per-bus shunt compensation: capacitors for load Q, reactors for line charging.
 
 German / European defaults:
-    * 50 Hz; 380 kV and 110 kV nominal voltages.
+    * 50 Hz; 380 kV and 110 kV nominal voltages; sites placed around central Germany.
     * Overhead lines with Al/St 265/35 conductors (DIN EN 50182 264-AL1/34-ST1A):
       single conductor at 110 kV, 2-bundle at 220 kV, 4-bundle at 380 kV.
     * Operating voltage ranges from ENTSO-E SO GL (Reg. 2017/1485, Annex II, Continental
       Europe): 110-300 kV 0.90-1.118 pu; 300-400 kV 360-420 kV.
 
 Conventions:
-    * Units: the CIM17 profile uses unprefixed SI units (V, W, VAr, VA, A, ohm, S, m).
-      All values are written as typed quantities, e.g.
-      <cim:BaseVoltage.nominalVoltage rdf:datatype="...#UnitSymbol.volt">380000.0</...>
-    * Sign: RotatingMachine.p/q and EnergyConsumer.p/q use the load sign convention
-      (positive = power flowing out of the network), so generator output is negative.
-      GeneratingUnit P limits and SynchronousMachine Q limits use generator convention.
+    * Sign: RotatingMachine.p/q, EnergyConsumer.p/q and SvPowerFlow use the load sign
+      convention (positive = out of the bus into the equipment), so generator output
+      is negative. GeneratingUnit P limits and machine Q limits use generator convention.
     * Transformer series impedance is referred to the high-voltage end (end 1).
     * Slack: the largest machine (on the backbone if there is one) has
       referencePriority=1, all others 0.
     * Reproducibility: the same arguments give the same model and mRIDs. Only the
-      md:FullModel header (export UUID and timestamp) differs between exports.
+      file headers' creation timestamp (and, for CIM17, the export UUID) differ.
 """
 
 import argparse
+import datetime
 import math
 import os
 import random
 import sys
-import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
-# The profile must be selected before cim-graph is imported.
-CIM_PROFILE = "cimprofiles.cim17.cim17v40"
-os.environ["CIMG_CIM_PROFILE"] = CIM_PROFILE
-os.environ["CIMG_USE_UNITS"] = "true"
-
 import networkx as nx
 import numpy as np
-import cimprofiles.cim17.cim17v40 as cim
-from cimprofiles.units import CIMUnit
-from cimgraph import utils
-from cimgraph.databases import XMLFile
-from cimgraph.models import GraphModel, NodeBreakerModel
+
+from cim_records import (CIM17_ONLY, DL, EQ, GL, SSH, SV, TP, Enum, Record, RecordSet, Ref,
+                         to_cimgraph, write_cgmes, write_cim17)
+import grid_verification as verification
 
 
-# ---------------------------------------------------------------------------
 # German / European default parameters
 # ---------------------------------------------------------------------------
 
@@ -149,7 +150,7 @@ BACKBONE_GEN_SHARE = 0.5       # share of --gens connected to the backbone
 UNIT_MVA = {"backbone": (400.0, 1100.0), "regional": (20.0, 150.0)}  # relative sizes before scaling
 RATED_POWER_FACTOR = 0.85
 MIN_P_FRACTION = 0.2           # GeneratingUnit.minOperatingP as a fraction of maxOperatingP
-GEN_VM_PU = {"backbone": (1.02, 1.05), "regional": (1.01, 1.04)}
+GEN_VM_PU = {"backbone": (1.03, 1.045), "regional": (1.02, 1.035)}  # coordinated setpoints, no Q circulation
 
 # Local reactive compensation per bus (LinearShuntCompensator), as in real grids
 CAP_COMPENSATION = 0.8         # capacitor covers this share of the bus's load Q
@@ -160,16 +161,6 @@ MIN_SHUNT_MVAR = 1.0           # smaller net compensation is not modelled
 # ---------------------------------------------------------------------------
 # Topology
 # ---------------------------------------------------------------------------
-
-class IdFactory:
-    """Deterministic UUIDv4 mRIDs from a seed, independent of the electrical RNG."""
-
-    def __init__(self, seed: int):
-        self._rng = random.Random(f"mrid-{seed}")
-
-    def __call__(self) -> str:
-        return str(uuid.UUID(int=self._rng.getrandbits(128), version=4))
-
 
 def default_backbone_buses(n_buses: int) -> int:
     n = round(n_buses / BUSES_PER_BACKBONE_SITE)
@@ -210,6 +201,12 @@ def build_corridors(pos: Sequence[Tuple[float, float]], avg_degree: float) -> nx
         if G.number_of_edges() >= target_edges:
             break
         G.add_edge(a, b)
+    # No dead ends: every substation is fed from two sides (n-1), as is usual practice.
+    if n >= 3:
+        for a in range(n):
+            if G.degree(a) < 2:
+                b = min((b for b in range(n) if b != a and not G.has_edge(a, b)), key=lambda b: dist(a, b))
+                G.add_edge(a, b)
 
     for a, b in G.edges():
         G.edges[a, b]["length_km"] = max(2.0, dist(a, b) * ROUTING_FACTOR)
@@ -340,7 +337,22 @@ def reinforce(n_bus: int, branches: List[Branch], injection_mw: Sequence[float],
     return added
 
 
-def create_synthetic_cim(
+@dataclass
+class Plan:
+    """A planned network: everything needed to emit CIM, no CIM objects yet."""
+    seed: int
+    voltage_kv: float
+    backbone_kv: float
+    n_buses: int               # lower-level buses (one per substation)
+    bus_kv: List[float]        # per global bus index
+    bus_site: List[int]        # substation of each bus
+    pos: List[Tuple[float, float]]   # substation coordinates [km]
+    branches: List[Branch]
+    loads: List[Tuple[int, float, float]]
+    gens: List[Gen]
+
+
+def plan_network(
     n_buses: int = 40,
     n_gens: int = 8,
     n_loads: int = 30,
@@ -348,8 +360,8 @@ def create_synthetic_cim(
     backbone_kv: float = DEFAULT_BACKBONE_KV,
     n_backbone: Optional[int] = None,
     seed: int = 42,
-) -> GraphModel:
-    """Build a GraphModel of a synthetic grid.
+) -> Plan:
+    """Plan a synthetic grid.
 
     n_buses is the number of lower-level (110 kV) buses, one per substation.
     n_backbone of those substations also get a backbone (380 kV) bus; None picks
@@ -444,427 +456,308 @@ def create_synthetic_cim(
                                    max_circuits=MAX_TRANSFORMERS_PER_SITE, circuits=count))
 
     # --- Reinforcement: parallel circuits / transformers where DC flows exceed ratings
-    slack_bus = gens[slack_idx].bus
-    reinforce(n_total, branches, injection, slack_bus)
+    reinforce(n_total, branches, injection, gens[slack_idx].bus)
 
-    return emit_cim(seed, voltage_kv, backbone_kv, n_buses, bus_kv, bus_site, branches, loads, gens)
+    return Plan(seed, voltage_kv, backbone_kv, n_buses, bus_kv, bus_site, pos, branches, loads, gens)
 
 
 # ---------------------------------------------------------------------------
-# CIM emission
+# CIM records (EQ, TP, SSH, GL, DL; SV added after the power flow)
 # ---------------------------------------------------------------------------
 
-def emit_cim(seed: int, voltage_kv: float, backbone_kv: float, n_buses: int,
-             bus_kv: List[float], bus_site: List[int], branches: List[Branch],
-             loads: List[Tuple[int, float, float]], gens: List[Gen]) -> GraphModel:
-    new_id = IdFactory(seed)
-    graph: Dict = {}
-    n_total = len(bus_kv)
+GEO_ORIGIN = (51.0, 10.0)      # latitude, longitude of the area centre (central Germany)
+KM_PER_DEG_LAT = 111.32
+DL_PX_PER_KM = 10.0            # diagram scale
+DL_MARGIN = 50.0
+DL_BACKBONE_OFFSET = (40.0, -40.0)   # backbone bus drawn up-right of its 110 kV bus
+DL_BUSBAR_HALF_WIDTH = 15.0
 
-    def create(cls, name: str):
-        obj = utils.create_object(cls, new_id(), graph)
-        obj.name = name
-        return obj
 
-    # --- Containers, base voltages, buses -----------------------------------------
-    region = create(cim.GeographicalRegion, "SyntheticRegion")
-    subregion = create(cim.SubGeographicalRegion, "SyntheticSubRegion")
-    subregion.Region = region
+@dataclass
+class Built:
+    """Records plus the handles needed to add the SV profile later."""
+    records: RecordSet
+    tn: List[Record]                    # TopologicalNode per bus
+    cn: List[Record]                    # ConnectivityNode per bus
+    vl: List[Record]                    # VoltageLevel per bus
+    terminals: List[Record]
+    shunts: List[Record]
+    slack_bus: int
+
+
+def build_records(plan: Plan) -> Built:
+    rs = RecordSet(plan.seed)
+    new = rs.new
+    n_total = len(plan.bus_kv)
+    bus_kv, bus_site = plan.bus_kv, plan.bus_site
+
+    # --- Coordinates -----------------------------------------------------------------
+    xs = [p[0] for p in plan.pos]
+    ys = [p[1] for p in plan.pos]
+    cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+    top = max(ys)
+
+    def lat_lon(site: int) -> Tuple[float, float]:
+        x, y = plan.pos[site]
+        lat = GEO_ORIGIN[0] + (y - cy) / KM_PER_DEG_LAT
+        lon = GEO_ORIGIN[1] + (x - cx) / (KM_PER_DEG_LAT * math.cos(math.radians(GEO_ORIGIN[0])))
+        return round(lat, 6), round(lon, 6)
+
+    def bus_xy(b: int) -> Tuple[float, float]:
+        """Diagram position (screen coordinates, y down, north up)."""
+        x, y = plan.pos[bus_site[b]]
+        px, py = DL_MARGIN + (x - min(xs)) * DL_PX_PER_KM, DL_MARGIN + (top - y) * DL_PX_PER_KM
+        if b >= plan.n_buses:
+            px, py = px + DL_BACKBONE_OFFSET[0], py + DL_BACKBONE_OFFSET[1]
+        return round(px, 1), round(py, 1)
+
+    # --- Containers, base voltages, buses, topological nodes ---------------------
+    region = new("GeographicalRegion", EQ, "SyntheticRegion")
+    subregion = new("SubGeographicalRegion", EQ, "SyntheticSubRegion").set("Region", Ref(region.id))
 
     base_voltages = {}
     for kv in sorted(set(bus_kv)):
-        bv = create(cim.BaseVoltage, f"{kv:g}kV")
-        bv.nominalVoltage = cim.Voltage(kv, "kV")
-        base_voltages[kv] = bv
+        base_voltages[kv] = new("BaseVoltage", EQ, f"{kv:g}kV").set("nominalVoltage", kv)
 
-    substations = []
-    for i in range(n_buses):
-        sub = create(cim.Substation, f"Sub_{i:03d}")
-        sub.Region = subregion
-        substations.append(sub)
+    substations = [new("Substation", EQ, f"Sub_{i:03d}").set("Region", Ref(subregion.id))
+                   for i in range(plan.n_buses)]
 
-    voltage_levels: List = []
-    cns: List = []
+    voltage_levels, cns, tns = [], [], []
     for b in range(n_total):
         kv, site = bus_kv[b], bus_site[b]
         lo, hi = voltage_limits_pu(kv)
-        vl = create(cim.VoltageLevel, f"VL_{site:03d}_{kv:g}kV")
-        vl.Substation = substations[site]
-        vl.BaseVoltage = base_voltages[kv]
-        vl.lowVoltageLimit = cim.Voltage(round(lo * kv, 3), "kV")
-        vl.highVoltageLimit = cim.Voltage(round(hi * kv, 3), "kV")
-        cn = create(cim.ConnectivityNode, f"Bus_{kv:g}kV_{site:03d}")
-        cn.ConnectivityNodeContainer = vl
+        bv = Ref(base_voltages[kv].id)
+        vl = (new("VoltageLevel", EQ, f"VL_{site:03d}_{kv:g}kV")
+              .set("Substation", Ref(substations[site].id)).set("BaseVoltage", bv)
+              .set("lowVoltageLimit", round(lo * kv, 3)).set("highVoltageLimit", round(hi * kv, 3)))
+        name = f"Bus_{kv:g}kV_{site:03d}"
+        tn = (new("TopologicalNode", TP, name).set("BaseVoltage", bv)
+              .set("ConnectivityNodeContainer", Ref(vl.id)))
+        cn = (new("ConnectivityNode", EQ, name).set("ConnectivityNodeContainer", Ref(vl.id))
+              .set("TopologicalNode", Ref(tn.id), TP))
         voltage_levels.append(vl)
         cns.append(cn)
+        tns.append(tn)
 
-    def connect(equipment, bus_idx: int, seq: int = 1):
-        term = create(cim.Terminal, f"{equipment.name}_T{seq}")
-        term.sequenceNumber = seq
-        term.connected = True
-        term.ConnectivityNode = cns[bus_idx]
-        term.ConductingEquipment = equipment
+    terminals: List[Record] = []
+
+    def connect(eq: Record, bus_i: int, seq: int = 1) -> Record:
+        term = (new("Terminal", EQ, f"{eq.get('name')}_T{seq}").set("sequenceNumber", seq)
+                .set("ConductingEquipment", Ref(eq.id)).set("ConnectivityNode", Ref(cns[bus_i].id))
+                .set("TopologicalNode", Ref(tns[bus_i].id), TP).set("connected", True, SSH))
+        terminals.append(term)
         return term
 
-    patl = create(cim.OperationalLimitType, "PATL")
-    patl.isInfiniteDuration = True
-    patl.direction = cim.OperationalLimitDirectionKind.absoluteValue
+    patl = (new("OperationalLimitType", EQ, "PATL")
+            .set("direction", Enum("OperationalLimitDirectionKind", "absoluteValue"))
+            .set("entsoe:OperationalLimitType.limitType", Enum("LimitTypeKind", "patl", "entsoe"))
+            .set("isInfiniteDuration", True, CIM17_ONLY))
 
-    def current_limit(term, amps: float):
-        ols = create(cim.OperationalLimitSet, f"{term.name}_Limits")
-        ols.Terminal = term
-        lim = create(cim.CurrentLimit, f"{term.name}_PATL")
-        lim.OperationalLimitSet = ols
-        lim.OperationalLimitType = patl
-        lim.value = cim.CurrentFlow(round(amps, 1), "A")
-        lim.normalValue = cim.CurrentFlow(round(amps, 1), "A")
+    def current_limit(term: Record, amps: float):
+        amps = round(amps, 1)
+        ols = new("OperationalLimitSet", EQ, f"{term.get('name')}_OLS").set("Terminal", Ref(term.id))
+        (new("CurrentLimit", EQ, f"{term.get('name')}_PATL").set("OperationalLimitSet", Ref(ols.id))
+         .set("OperationalLimitType", Ref(patl.id)).set("value", amps).set("normalValue", amps, CIM17_ONLY))
+
+    # --- Geography (GL) and diagram (DL) helpers ----------------------------------
+    crs = new("CoordinateSystem", GL, "WGS84").set("crsUrn", "urn:ogc:def:crs:EPSG::4326")
+
+    def locate(psr: Record, sites: Sequence[int]):
+        loc = (new("Location", GL, f"{psr.get('name')}_Loc").set("CoordinateSystem", Ref(crs.id))
+               .set("PowerSystemResources", Ref(psr.id)))
+        for k, site in enumerate(sites, start=1):
+            lat, lon = lat_lon(site)
+            (new("PositionPoint", GL).set("Location", Ref(loc.id)).set("sequenceNumber", k)
+             .set("xPosition", f"{lon:.6f}").set("yPosition", f"{lat:.6f}"))
+
+    diagram = new("Diagram", DL, "Overview").set("orientation", Enum("OrientationKind", "negative"))
+
+    def draw(obj: Record, points: Sequence[Tuple[float, float]], order: int):
+        do = (new("DiagramObject", DL, f"{obj.get('name')}_DO").set("Diagram", Ref(diagram.id))
+              .set("IdentifiedObject", Ref(obj.id)).set("rotation", 0.0)
+              .set("drawingOrder", order).set("isPolygon", False))
+        for k, (x, y) in enumerate(points, start=1):
+            (new("DiagramObjectPoint", DL).set("DiagramObject", Ref(do.id)).set("sequenceNumber", k)
+             .set("xPosition", float(round(x, 1))).set("yPosition", float(round(y, 1))))
+
+    for i, sub in enumerate(substations):
+        locate(sub, [i])
+    for b in range(n_total):
+        x, y = bus_xy(b)
+        draw(cns[b], [(x - DL_BUSBAR_HALF_WIDTH, y), (x + DL_BUSBAR_HALF_WIDTH, y)], 3)
 
     # --- Lines: one Line container per corridor, one ACLineSegment per circuit -----
     bus_charging_mvar = [0.0] * n_total   # half of each circuit's charging at each end
-    for br in (b for b in branches if b.kind == "line"):
+    for br in (b for b in plan.branches if b.kind == "line"):
         kv = bus_kv[br.u]
         lt = line_type(kv)
         name = f"Line_{kv:g}kV_{bus_site[br.u]:03d}_{bus_site[br.v]:03d}"
-        line_container = create(cim.Line, name)
-        line_container.Region = subregion
+        line_container = new("Line", EQ, name).set("Region", Ref(subregion.id))
+        (x1, y1), (x2, y2) = bus_xy(br.u), bus_xy(br.v)
+        length = math.hypot(x2 - x1, y2 - y1) or 1.0
+        nx_, ny_ = -(y2 - y1) / length, (x2 - x1) / length        # unit normal for parallel circuits
         for c in range(1, br.circuits + 1):
-            seg = create(cim.ACLineSegment, f"{name}_C{c}")
-            seg.description = f"{lt.name}, circuit {c} of {br.circuits}"
-            seg.EquipmentContainer = line_container
-            seg.BaseVoltage = base_voltages[kv]
-            seg.length = cim.Length(round(br.length_km, 2), "km")
-            seg.r = cim.Resistance(br.r_ohm, "ohm")
-            seg.x = cim.Reactance(br.x_ohm, "ohm")
-            seg.bch = cim.Susceptance(br.bch_s, "S")
+            seg = (new("ACLineSegment", EQ, f"{name}_C{c}")
+                   .set("description", f"{lt.name}, circuit {c} of {br.circuits}")
+                   .set("EquipmentContainer", Ref(line_container.id))
+                   .set("BaseVoltage", Ref(base_voltages[kv].id))
+                   .set("length", round(br.length_km, 2))
+                   .set("r", br.r_ohm).set("x", br.x_ohm).set("bch", br.bch_s).set("gch", 0.0))
             for seq, b in ((1, br.u), (2, br.v)):
                 current_limit(connect(seg, b, seq), lt.i_th_a)
                 bus_charging_mvar[b] += br.bch_s * kv**2 / 2
+            locate(seg, [bus_site[br.u], bus_site[br.v]])
+            off = (c - (br.circuits + 1) / 2) * 6.0
+            draw(seg, [(x1 + nx_ * off, y1 + ny_ * off), (x2 + nx_ * off, y2 + ny_ * off)], 1)
 
-    # --- Loads (EnergyConsumer, load sign convention) ---------------------------
+    # Per-bus slots for drawing equipment next to its busbar
+    slots: Dict[Tuple[int, str], int] = {}
+
+    def slot_xy(bus_i: int, kind: str) -> Tuple[float, float]:
+        k = slots.get((bus_i, kind), 0)
+        slots[(bus_i, kind)] = k + 1
+        x, y = bus_xy(bus_i)
+        dx, dy = {"gen": (0.0, -22.0), "load": (0.0, 22.0), "shunt": (24.0, 8.0)}[kind]
+        return x + dx + 10.0 * k, y + dy
+
+    # --- Loads -----------------------------------------------------------------------
     bus_load_q = [0.0] * n_total
-    for idx, (bus_i, p_mw, q_mvar) in enumerate(loads):
+    for idx, (bus_i, p_mw, q_mvar) in enumerate(plan.loads):
         bus_load_q[bus_i] += q_mvar
-        load = create(cim.EnergyConsumer, f"Load_{idx:02d}")
-        load.EquipmentContainer = voltage_levels[bus_i]
-        load.BaseVoltage = base_voltages[bus_kv[bus_i]]
-        load.p = cim.ActivePower(p_mw, "MW")
-        load.q = cim.ReactivePower(q_mvar, "MVAr")
+        load = (new("EnergyConsumer", EQ, f"Load_{idx:02d}")
+                .set("EquipmentContainer", Ref(voltage_levels[bus_i].id))
+                .set("BaseVoltage", Ref(base_voltages[bus_kv[bus_i]].id))
+                .set("p", p_mw, SSH).set("q", q_mvar, SSH))
         connect(load, bus_i)
+        draw(load, [slot_xy(bus_i, "load")], 2)
 
     # --- Shunt compensation: capacitors at load buses, reactors against line charging
+    shunts: List[Record] = []
     for bus_i in range(n_total):
         q_mvar = CAP_COMPENSATION * bus_load_q[bus_i] - REACTOR_COMPENSATION * bus_charging_mvar[bus_i]
         if abs(q_mvar) < MIN_SHUNT_MVAR:
             continue
         kv = bus_kv[bus_i]
         kind = "Cap" if q_mvar > 0 else "Reactor"
-        shunt = create(cim.LinearShuntCompensator, f"{kind}_{kv:g}kV_{bus_site[bus_i]:03d}")
-        shunt.EquipmentContainer = voltage_levels[bus_i]
-        shunt.BaseVoltage = base_voltages[kv]
-        shunt.nomU = cim.Voltage(kv, "kV")
-        shunt.bPerSection = cim.Susceptance(round(q_mvar / kv**2, 9), "S")  # b > 0: capacitive
-        shunt.gPerSection = cim.Conductance(0.0, "S")
-        shunt.maximumSections = 1
-        shunt.normalSections = 1
-        shunt.sections = 1.0
-        shunt.grounded = True
+        shunt = (new("LinearShuntCompensator", EQ, f"{kind}_{kv:g}kV_{bus_site[bus_i]:03d}")
+                 .set("EquipmentContainer", Ref(voltage_levels[bus_i].id))
+                 .set("BaseVoltage", Ref(base_voltages[kv].id))
+                 .set("nomU", kv)
+                 .set("bPerSection", round(q_mvar / kv**2, 9))            # b > 0: capacitive
+                 .set("gPerSection", 0.0)
+                 .set("maximumSections", 1).set("normalSections", 1).set("grounded", True)
+                 .set("sections", 1.0, SSH).set("controlEnabled", False, SSH))
         connect(shunt, bus_i)
+        draw(shunt, [slot_xy(bus_i, "shunt")], 2)
+        shunts.append(shunt)
 
-    # --- Generators (SynchronousMachine + GeneratingUnit + RegulatingControl) --
-    for idx, g in enumerate(gens):
+    # --- Generators (SynchronousMachine + ThermalGeneratingUnit + RegulatingControl) --
+    fleet_max_p = sum(g.max_p for g in plan.gens)
+    for idx, g in enumerate(plan.gens):
         kv = bus_kv[g.bus]
         name = f"Gen_{kv:g}kV_{idx:02d}"
-        vl = voltage_levels[g.bus]
-
-        unit = create(cim.GeneratingUnit, f"{name}_GU")
-        unit.EquipmentContainer = vl
-        unit.maxOperatingP = cim.ActivePower(round(g.max_p, 2), "MW")
-        unit.minOperatingP = cim.ActivePower(round(MIN_P_FRACTION * g.max_p, 2), "MW")
-        unit.nominalP = cim.ActivePower(round(g.max_p, 2), "MW")
-        unit.initialP = cim.ActivePower(g.p, "MW")
-
-        gen = create(cim.SynchronousMachine, name)
-        gen.EquipmentContainer = vl
-        gen.BaseVoltage = base_voltages[kv]
-        gen.GeneratingUnit = unit
-        gen.type = cim.SynchronousMachineKind.generator
-        gen.operatingMode = cim.SynchronousMachineOperatingMode.generator
-        gen.referencePriority = 1 if g.slack else 0
-        gen.ratedS = cim.ApparentPower(g.rated_s, "MVA")
-        gen.ratedU = cim.Voltage(kv, "kV")
-        gen.ratedPowerFactor = RATED_POWER_FACTOR
+        vl = Ref(voltage_levels[g.bus].id)
+        unit = (new("ThermalGeneratingUnit", EQ, f"{name}_GU").set("EquipmentContainer", vl)
+                .set("maxOperatingP", round(g.max_p, 2))
+                .set("minOperatingP", round(MIN_P_FRACTION * g.max_p, 2))
+                .set("nominalP", round(g.max_p, 2)).set("initialP", g.p)
+                .set("genControlSource", Enum("GeneratorControlSource", "offAGC"))
+                .set("normalPF", round(g.max_p / fleet_max_p, 4), SSH))
         q_cap = g.rated_s * math.sqrt(1 - RATED_POWER_FACTOR**2)
-        gen.maxQ = cim.ReactivePower(round(q_cap, 2), "MVAr")
-        gen.minQ = cim.ReactivePower(round(-0.5 * q_cap, 2), "MVAr")
-        gen.p = cim.ActivePower(-g.p, "MW")      # load sign convention
-        gen.q = cim.ReactivePower(-g.q0, "MVAr")
+        gen = (new("SynchronousMachine", EQ, name).set("EquipmentContainer", vl)
+               .set("BaseVoltage", Ref(base_voltages[kv].id)).set("GeneratingUnit", Ref(unit.id))
+               .set("type", Enum("SynchronousMachineKind", "generator"))
+               .set("ratedS", g.rated_s).set("ratedU", kv).set("ratedPowerFactor", RATED_POWER_FACTOR)
+               .set("maxQ", round(q_cap, 2)).set("minQ", round(-0.5 * q_cap, 2))
+               # SSH: load sign convention
+               .set("p", -g.p, SSH).set("q", -g.q0, SSH)
+               .set("referencePriority", 1 if g.slack else 0, SSH)
+               .set("operatingMode", Enum("SynchronousMachineOperatingMode", "generator"), SSH)
+               .set("controlEnabled", True, SSH))
         term = connect(gen, g.bus)
-
-        rc = create(cim.RegulatingControl, f"{name}_RC")
-        rc.mode = cim.RegulatingControlModeKind.voltage
-        rc.Terminal = term
-        rc.enabled = True
-        rc.targetValue = round(g.vm_pu * kv, 3)
-        rc.targetValueUnitMultiplier = cim.UnitMultiplier.k
-        rc.targetDeadband = 0.5
-        gen.RegulatingControl = rc
-        gen.controlEnabled = True
+        rc = (new("RegulatingControl", EQ, f"{name}_RC")
+              .set("mode", Enum("RegulatingControlModeKind", "voltage")).set("Terminal", Ref(term.id))
+              .set("discrete", False, SSH).set("enabled", True, SSH).set("targetDeadband", 0.5, SSH)
+              .set("targetValue", round(g.vm_pu * kv, 3), SSH)
+              .set("targetValueUnitMultiplier", Enum("UnitMultiplier", "k"), SSH))
+        gen.set("RegulatingControl", Ref(rc.id))
+        draw(gen, [slot_xy(g.bus, "gen")], 2)
 
     # --- Transformers ----------------------------------------------------------------
-    if any(b.kind == "trafo" for b in branches):
-        t = transformer_type(backbone_kv, voltage_kv)
-        z_base = backbone_kv**2 / t.rated_s_mva
-        r_ohm = t.ur_percent / 100 * z_base
-        x_ohm = math.sqrt((t.uk_percent / 100 * z_base) ** 2 - r_ohm**2)
-    for br in (b for b in branches if b.kind == "trafo"):
+    t = transformer_type(plan.backbone_kv, plan.voltage_kv)
+    z_base = plan.backbone_kv**2 / t.rated_s_mva
+    r_ohm = t.ur_percent / 100 * z_base
+    x_ohm = math.sqrt((t.uk_percent / 100 * z_base) ** 2 - r_ohm**2)
+    for br in (b for b in plan.branches if b.kind == "trafo"):
         site = bus_site[br.v]
+        (xh, yh), (xl, yl) = bus_xy(br.u), bus_xy(br.v)
         for k in range(br.circuits):
-            pt = create(cim.PowerTransformer, f"TR_{site:03d}_{k + 1}")
-            pt.EquipmentContainer = substations[site]
-            pt.vectorGroup = "YNyn0"
+            pt = (new("PowerTransformer", EQ, f"TR_{site:03d}_{k + 1}")
+                  .set("EquipmentContainer", Ref(substations[site].id))
+                  .set("vectorGroup", "YNyn0", CIM17_ONLY))
             for end_no, bus_i in ((1, br.u), (2, br.v)):
                 kv = bus_kv[bus_i]
-                end = create(cim.PowerTransformerEnd, f"{pt.name}_End{end_no}")
-                end.PowerTransformer = pt
-                end.endNumber = end_no
-                end.BaseVoltage = base_voltages[kv]
-                end.ratedS = cim.ApparentPower(t.rated_s_mva, "MVA")
-                end.ratedU = cim.Voltage(kv, "kV")
-                end.r = cim.Resistance(round(r_ohm if end_no == 1 else 0.0, 4), "ohm")
-                end.x = cim.Reactance(round(x_ohm if end_no == 1 else 0.0, 4), "ohm")
-                end.g = cim.Conductance(0.0, "S")
-                end.b = cim.Susceptance(0.0, "S")
-                end.connectionKind = cim.WindingConnection.Yn
-                end.phaseAngleClock = 0
+                end = (new("PowerTransformerEnd", EQ, f"{pt.get('name')}_End{end_no}")
+                       .set("PowerTransformer", Ref(pt.id)).set("endNumber", end_no)
+                       .set("BaseVoltage", Ref(base_voltages[kv].id))
+                       .set("ratedS", t.rated_s_mva).set("ratedU", kv)
+                       .set("r", round(r_ohm if end_no == 1 else 0.0, 4))
+                       .set("x", round(x_ohm if end_no == 1 else 0.0, 4))
+                       .set("g", 0.0).set("b", 0.0)
+                       .set("connectionKind", Enum("WindingConnection", "Yn")).set("phaseAngleClock", 0))
                 term = connect(pt, bus_i, end_no)
-                end.Terminal = term
+                end.set("Terminal", Ref(term.id))
                 current_limit(term, t.rated_s_mva / (math.sqrt(3) * kv) * 1000)
+            off = (k - (br.circuits - 1) / 2) * 8.0
+            draw(pt, [((xh + xl) / 2 + off, (yh + yl) / 2)], 2)
 
-    return GraphModel(container=None, connection=None, graph=graph)
+    slack_bus = next(g.bus for g in plan.gens if g.slack)
+    return Built(rs, tns, cns, voltage_levels, terminals, shunts, slack_bus)
+
+
+def add_state_variables(built: Built, state: Dict) -> None:
+    """Add the SV profile from a solved power flow (see verification.solve_state)."""
+    new = built.records.new
+    (new("TopologicalIsland", SV, "Island_1")
+     .set("AngleRefTopologicalNode", Ref(built.tn[built.slack_bus].id))
+     .set("TopologicalNodes", [Ref(tn.id) for tn in built.tn]))
+    for tn, cn in zip(built.tn, built.cn):
+        v_kv, angle = state["bus"][cn.id]
+        new("SvVoltage", SV).set("TopologicalNode", Ref(tn.id)).set("v", round(v_kv, 4)).set("angle", round(angle, 4))
+    for term in built.terminals:
+        p, q = state["terminal"][term.id]
+        new("SvPowerFlow", SV).set("Terminal", Ref(term.id)).set("p", round(p, 4)).set("q", round(q, 4))
+    for sh in built.shunts:
+        new("SvShuntCompensatorSections", SV).set("ShuntCompensator", Ref(sh.id)).set("sections", 1.0)
+
+
+def generate(**kwargs) -> Tuple[Plan, Built, Optional[Dict]]:
+    """Plan the grid, build all records and, if pandapower is available and the
+    power flow converges, the SV profile. Returns (plan, built, state)."""
+    plan = plan_network(**kwargs)
+    built = build_records(plan)
+    state = verification.solve_state(to_cimgraph(built.records.records), FREQUENCY_HZ)
+    if state is not None:
+        add_state_variables(built, state)
+    return plan, built, state
+
+
+def create_synthetic_cim(**kwargs):
+    """In-memory cim-graph (CIM17) model of a synthetic grid."""
+    _, built, _ = generate(**kwargs)
+    return to_cimgraph(built.records.records)
+
 
 # ---------------------------------------------------------------------------
-# Verification
+# Command line
 # ---------------------------------------------------------------------------
 
-def _objs(model: GraphModel, cls) -> list:
-    return list(model.graph.get(cls, {}).values())
-
-
-def _terminals_by_equipment(model: GraphModel) -> Dict:
-    out: Dict = {}
-    for t in _objs(model, cim.Terminal):
-        if t.ConductingEquipment is not None:
-            out.setdefault(t.ConductingEquipment.identifier, []).append(t)
-    for ts in out.values():
-        ts.sort(key=lambda t: t.sequenceNumber or 0)
-    return out
-
-
-def _current_limits(model: GraphModel) -> Dict:
-    """Terminal identifier -> PATL current limit [A]."""
-    limits = {}
-    for lim in _objs(model, cim.CurrentLimit):
-        ols = lim.OperationalLimitSet
-        if ols is not None and ols.Terminal is not None and lim.value is not None:
-            limits[ols.Terminal.identifier] = lim.value.to("A")
-    return limits
-
-
-def _transformer_ends(model: GraphModel) -> Dict:
-    ends: Dict = {}
-    for e in _objs(model, cim.PowerTransformerEnd):
-        if e.PowerTransformer is not None:
-            ends.setdefault(e.PowerTransformer.identifier, []).append(e)
-    for es in ends.values():
-        es.sort(key=lambda e: e.endNumber or 0)
-    return ends
-
-
-def check_model(model: GraphModel) -> List[str]:
-    """Structural and electrical sanity checks. Returns a list of problems."""
-    problems: List[str] = []
-    terms_by_eq = _terminals_by_equipment(model)
-    limits = _current_limits(model)
-    G = nx.Graph()
-    for cn in _objs(model, cim.ConnectivityNode):
-        G.add_node(cn.identifier)
-        if cn.ConnectivityNodeContainer is None:
-            problems.append(f"{cn.name}: no ConnectivityNodeContainer")
-    for t in _objs(model, cim.Terminal):
-        if t.ConnectivityNode is None or t.ConductingEquipment is None:
-            problems.append(f"{t.name}: dangling terminal")
-
-    for seg in _objs(model, cim.ACLineSegment):
-        ts = terms_by_eq.get(seg.identifier, [])
-        if len(ts) != 2:
-            problems.append(f"{seg.name}: {len(ts)} terminals, expected 2")
-            continue
-        G.add_edge(ts[0].ConnectivityNode.identifier, ts[1].ConnectivityNode.identifier)
-        for attr in ("r", "x", "bch", "length"):
-            if not isinstance(getattr(seg, attr), CIMUnit):
-                problems.append(f"{seg.name}.{attr}: missing or untyped")
-        if not all(t.identifier in limits for t in ts):
-            problems.append(f"{seg.name}: missing current limit")
-
-    ends_by_pt = _transformer_ends(model)
-    for pt in _objs(model, cim.PowerTransformer):
-        ends = ends_by_pt.get(pt.identifier, [])
-        if len(ends) != 2 or any(e.Terminal is None for e in ends):
-            problems.append(f"{pt.name}: expected 2 ends with terminals")
-            continue
-        vls = [e.Terminal.ConnectivityNode.ConnectivityNodeContainer for e in ends]
-        if vls[0] is vls[1] or vls[0].Substation is not vls[1].Substation:
-            problems.append(f"{pt.name}: ends must be in different voltage levels of one substation")
-        if pt.EquipmentContainer is None:
-            problems.append(f"{pt.name}: no EquipmentContainer")
-        G.add_edge(*(e.Terminal.ConnectivityNode.identifier for e in ends))
-
-    for cls in (cim.SynchronousMachine, cim.EnergyConsumer, cim.LinearShuntCompensator, cim.ACLineSegment):
-        for eq in _objs(model, cls):
-            if eq.EquipmentContainer is None:
-                problems.append(f"{eq.name}: no EquipmentContainer")
-            if cls is not cim.ACLineSegment and len(terms_by_eq.get(eq.identifier, [])) != 1:
-                problems.append(f"{eq.name}: expected 1 terminal")
-
-    if G.number_of_nodes() and not nx.is_connected(G):
-        problems.append("network is not connected")
-
-    gens = _objs(model, cim.SynchronousMachine)
-    slacks = [g for g in gens if (g.referencePriority or 0) > 0]
-    if len(slacks) != 1:
-        problems.append(f"{len(slacks)} slack machines (referencePriority > 0), expected 1")
-    for g in gens:
-        if not isinstance(g.type, cim.SynchronousMachineKind):
-            problems.append(f"{g.name}.type is not a SynchronousMachineKind enum")
-        if g.GeneratingUnit is None or g.RegulatingControl is None:
-            problems.append(f"{g.name}: missing GeneratingUnit or RegulatingControl")
-            continue
-        p_out = -g.p.to("MW")
-        if not g.GeneratingUnit.minOperatingP.to("MW") <= p_out <= g.GeneratingUnit.maxOperatingP.to("MW"):
-            problems.append(f"{g.name}: dispatch {p_out:.1f} MW outside unit limits")
-    return problems
-
-
-def run_power_flow(model: GraphModel) -> Tuple[bool, List[str]]:
-    """Convert the read-back CIM model to pandapower and solve an AC power flow.
-    Checks bus voltages against each VoltageLevel's limits and branch loading
-    against the PATL current limits / transformer ratings."""
-    try:
-        import warnings
-        warnings.filterwarnings("ignore")
-        import pandapower as pp
-    except ImportError:
-        return True, ["skipped (pandapower not installed)"]
-
-    net = pp.create_empty_network(f_hz=FREQUENCY_HZ)
-    bus_of: Dict = {}
-    vlim: Dict = {}
-    for cn in _objs(model, cim.ConnectivityNode):
-        vl = cn.ConnectivityNodeContainer
-        vn_kv = vl.BaseVoltage.nominalVoltage.to("kV")
-        b = pp.create_bus(net, vn_kv=vn_kv, name=cn.name)
-        bus_of[cn.identifier] = b
-        vlim[b] = (vl.lowVoltageLimit.to("kV") / vn_kv, vl.highVoltageLimit.to("kV") / vn_kv)
-
-    terms_by_eq = _terminals_by_equipment(model)
-    limits = _current_limits(model)
-
-    def bus(eq, i=0):
-        return bus_of[terms_by_eq[eq.identifier][i].ConnectivityNode.identifier]
-
-    for seg in _objs(model, cim.ACLineSegment):
-        km = seg.length.to("km")
-        i_max = min(limits.get(t.identifier, math.inf) for t in terms_by_eq[seg.identifier])
-        pp.create_line_from_parameters(
-            net, bus(seg, 0), bus(seg, 1), length_km=km, name=seg.name,
-            r_ohm_per_km=float(seg.r) / km, x_ohm_per_km=float(seg.x) / km,
-            c_nf_per_km=float(seg.bch) / (2 * math.pi * net.f_hz) / km * 1e9,
-            max_i_ka=i_max / 1000 if math.isfinite(i_max) else 99.0)
-    for pt, ends in ((pt, _transformer_ends(model)[pt.identifier]) for pt in _objs(model, cim.PowerTransformer)):
-        hv, lv = ends
-        s = hv.ratedS.to("MVA")
-        u_hv = hv.ratedU.to("kV")
-        z_base = u_hv**2 / s
-        r = float(hv.r) + float(lv.r) * (u_hv / lv.ratedU.to("kV")) ** 2
-        x = float(hv.x) + float(lv.x) * (u_hv / lv.ratedU.to("kV")) ** 2
-        pp.create_transformer_from_parameters(
-            net, bus_of[hv.Terminal.ConnectivityNode.identifier], bus_of[lv.Terminal.ConnectivityNode.identifier],
-            sn_mva=s, vn_hv_kv=u_hv, vn_lv_kv=lv.ratedU.to("kV"),
-            vkr_percent=r / z_base * 100, vk_percent=math.hypot(r, x) / z_base * 100,
-            pfe_kw=0.0, i0_percent=0.0, name=pt.name)
-    for load in _objs(model, cim.EnergyConsumer):
-        pp.create_load(net, bus(load), p_mw=load.p.to("MW"), q_mvar=load.q.to("MVAr"), name=load.name)
-    for sh in _objs(model, cim.LinearShuntCompensator):
-        vn = sh.nomU.to("kV")
-        # pandapower: q_mvar > 0 absorbs; CIM: b > 0 is capacitive (injects)
-        pp.create_shunt(net, bus(sh), q_mvar=-float(sh.bPerSection) * vn**2, p_mw=float(sh.gPerSection) * vn**2,
-                        vn_kv=vn, step=int(sh.sections), max_step=sh.maximumSections, name=sh.name)
-    for g in _objs(model, cim.SynchronousMachine):
-        b = bus(g)
-        pp.create_gen(net, b, p_mw=-g.p.to("MW"), name=g.name,
-                      vm_pu=g.RegulatingControl.targetValue / net.bus.vn_kv.at[b],
-                      min_q_mvar=g.minQ.to("MVAr"), max_q_mvar=g.maxQ.to("MVAr"),
-                      slack=(g.referencePriority or 0) > 0)
-
-    try:
-        pp.runpp(net, algorithm="nr", enforce_q_lims=True, numba=False)
-    except Exception as e:  # pandapower raises LoadflowNotConverged
-        return False, [f"did not converge ({type(e).__name__})"]
-
-    ok = True
-    slack_p = net.res_gen[net.gen.slack].p_mw.iloc[0]
-    losses = net.res_line.pl_mw.sum() + (net.res_trafo.pl_mw.sum() if len(net.trafo) else 0.0)
-    lines = [f"converged; slack P={slack_p:.1f} MW, losses={losses:.2f} MW"]
-    for kv in sorted(net.bus.vn_kv.unique()):
-        idx = net.bus.index[net.bus.vn_kv == kv]
-        vm = net.res_bus.vm_pu[idx]
-        bad = [b for b in idx if not vlim[b][0] <= net.res_bus.vm_pu.at[b] <= vlim[b][1]]
-        ok &= not bad
-        lines.append(f"{kv:g} kV: V=[{vm.min():.3f}, {vm.max():.3f}] pu "
-                     f"({vm.min() * kv:.1f}-{vm.max() * kv:.1f} kV)"
-                     + (f", {len(bad)} bus(es) OUTSIDE limits" if bad else ""))
-    for label, res in (("lines", net.res_line), ("transformers", net.res_trafo)):
-        if len(res):
-            over = int((res.loading_percent > 100).sum())
-            ok &= over == 0
-            lines.append(f"{label}: max loading {res.loading_percent.max():.0f} %"
-                         + (f", {over} OVERLOADED" if over else ""))
-    return ok, lines
-
-
-def verify(filename: str, expected_counts: Dict[str, int]) -> bool:
-    """Read the file back with cim-graph and check it object by object."""
-    ok = True
-    model = NodeBreakerModel(container=None, connection=XMLFile(filename=filename))
-    counts = {cls.__name__: len(objs) for cls, objs in model.graph.items() if objs}
-    if counts == expected_counts:
-        print(f"  Round-trip: OK ({sum(counts.values())} objects read back, counts match)")
-    else:
-        ok = False
-        print(f"  Round-trip: MISMATCH\n    written: {expected_counts}\n    read:    {counts}")
-
-    problems = check_model(model)
-    if problems:
-        ok = False
-        print(f"  Model checks: {len(problems)} problem(s)")
-        for p in problems:
-            print(f"    - {p}")
-    else:
-        print("  Model checks: OK (connected, terminals/ends wired, containers, limits, 1 slack, P within limits)")
-
-    gen_p = sum(-g.p.to("MW") for g in _objs(model, cim.SynchronousMachine))
-    load_p = sum(l.p.to("MW") for l in _objs(model, cim.EnergyConsumer))
-    print(f"  Balance: generation {gen_p:.1f} MW, load {load_p:.1f} MW")
-
-    pf_ok, pf_lines = run_power_flow(model)
-    print(f"  AC power flow: {pf_lines[0]}")
-    for line in pf_lines[1:]:
-        print(f"    {line}")
-    return ok and pf_ok
+SCENARIO_TIME = datetime.datetime(2025, 1, 15, 11, 30, tzinfo=datetime.timezone.utc)  # winter weekday
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Synthetic CIM power grid generator (German/European defaults)")
+    parser = argparse.ArgumentParser(description="Synthetic CIM/CGMES power grid generator "
+                                                 "(German/European defaults)")
     parser.add_argument("--buses", type=int, default=40, help="Number of lower-level (110 kV) buses / substations")
     parser.add_argument("--gens", type=int, default=8, help="Number of generators")
     parser.add_argument("--loads", type=int, default=30, help="Number of loads (at lower-level buses)")
@@ -875,7 +768,11 @@ def main():
                         help=f"Substations with a backbone bus (default: buses/{BUSES_PER_BACKBONE_SITE}, "
                              f"0 for a single-level grid)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--output", type=str, default="synthetic_grid.cim.xml", help="Output CIM XML path")
+    parser.add_argument("--format", choices=["both", "cim17", "cgmes"], default="both",
+                        help="Output format(s): CIM17 RDF/XML, CGMES 2.4.15 zip, or both")
+    parser.add_argument("--output", type=str, default="synthetic_grid.cim.xml", help="CIM17 output path")
+    parser.add_argument("--cgmes-output", type=str, default=None,
+                        help="CGMES zip output path (default: <output stem>_CGMES.zip)")
     args = parser.parse_args()
 
     n_backbone = default_backbone_buses(args.buses) if args.backbone_buses is None else args.backbone_buses
@@ -883,29 +780,44 @@ def main():
         validate_sizes(args.buses, args.gens, args.loads, n_backbone, args.voltage, args.backbone_voltage)
     except ValueError as e:
         parser.error(str(e))
+    cgmes_out = args.cgmes_output or (args.output.split(".")[0] + "_CGMES.zip")
 
     levels = f"{args.voltage:g} kV"
     if n_backbone:
         levels = f"{args.backbone_voltage:g}/{args.voltage:g} kV, {n_backbone} backbone buses"
+    description = (f"Synthetic grid {args.buses} buses {args.gens} gens {args.loads} loads "
+                   f"{levels} seed {args.seed}")
     print(f"Generating synthetic grid: {args.buses} buses, {args.gens} gens, {args.loads} loads "
           f"@ {levels}, {FREQUENCY_HZ:g} Hz (seed={args.seed})")
-    network = create_synthetic_cim(
-        n_buses=args.buses,
-        n_gens=args.gens,
-        n_loads=args.loads,
-        voltage_kv=args.voltage,
-        backbone_kv=args.backbone_voltage,
-        n_backbone=n_backbone,
-        seed=args.seed,
-    )
-
-    utils.write_xml(network, args.output)
-    counts = {cls.__name__: len(objs) for cls, objs in network.graph.items()}
-    print(f"Wrote CIM RDF/XML → {args.output} ({os.path.getsize(args.output)} bytes)")
+    plan, built, state = generate(
+        n_buses=args.buses, n_gens=args.gens, n_loads=args.loads, voltage_kv=args.voltage,
+        backbone_kv=args.backbone_voltage, n_backbone=n_backbone, seed=args.seed)
+    records = built.records.records
+    counts = built.records.counts()
     print("Object counts:", counts)
+    if state is None:
+        print("Note: no SV profile (pandapower missing or power flow did not converge)")
 
-    print("Verification:")
-    ok = verify(args.output, counts)
+    ok = True
+    if args.format in ("both", "cim17"):
+        write_cim17(records, args.output)
+        print(f"Wrote CIM17 RDF/XML → {args.output} ({os.path.getsize(args.output)} bytes)")
+        print("Verification (CIM17):")
+        ok &= verification.verify_cim17(args.output, counts, FREQUENCY_HZ)
+
+    if args.format in ("both", "cgmes"):
+        files = write_cgmes(records, cgmes_out, args.seed, description, SCENARIO_TIME)
+        print(f"Wrote CGMES 2.4.15 → {cgmes_out} ({os.path.getsize(cgmes_out)} bytes): "
+              + ", ".join(f.split("_")[3] for f in files))
+        print("Verification (CGMES):")
+        expected = {k: counts.get(k, 0) for k in ("TopologicalNode", "ACLineSegment", "PowerTransformer",
+                                                  "SynchronousMachine", "EnergyConsumer",
+                                                  "LinearShuntCompensator")}
+        sv = None
+        if state is not None:
+            sv = {vl.id: state["bus"][cn.id][0] for vl, cn in zip(built.vl, built.cn)}
+        ok &= verification.verify_cgmes(cgmes_out, expected, sv)
+
     print("Done." if ok else "Verification FAILED.")
     sys.exit(0 if ok else 1)
 
