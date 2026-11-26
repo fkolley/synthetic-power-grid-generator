@@ -773,6 +773,8 @@ def main():
     parser.add_argument("--output", type=str, default="synthetic_grid.cim.xml", help="CIM17 output path")
     parser.add_argument("--cgmes-output", type=str, default=None,
                         help="CGMES zip output path (default: <output stem>_CGMES.zip)")
+    parser.add_argument("--skip-n1", action="store_true",
+                        help="Skip the N-1 contingency report (saves time on large grids)")
     args = parser.parse_args()
 
     n_backbone = default_backbone_buses(args.buses) if args.backbone_buses is None else args.backbone_buses
@@ -803,7 +805,7 @@ def main():
         write_cim17(records, args.output)
         print(f"Wrote CIM17 RDF/XML → {args.output} ({os.path.getsize(args.output)} bytes)")
         print("Verification (CIM17):")
-        ok &= verification.verify_cim17(args.output, counts, FREQUENCY_HZ)
+        ok &= verification.verify_cim17(args.output, counts, FREQUENCY_HZ, n1=not args.skip_n1)
 
     if args.format in ("both", "cgmes"):
         files = write_cgmes(records, cgmes_out, args.seed, description, SCENARIO_TIME)
