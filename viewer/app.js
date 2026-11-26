@@ -61,7 +61,7 @@
 
   // --- Maps ------------------------------------------------------------------------
   function makePanes(map) {
-    for (const [name, z] of [["halo", 405], ["lines", 410], ["flow", 412], ["conn", 415], ["buses", 420]]) {
+    for (const [name, z] of [["boxes", 402], ["halo", 405], ["lines", 410], ["flow", 412], ["conn", 415], ["buses", 420]]) {
       map.createPane(name).style.zIndex = z;
     }
   }
@@ -232,7 +232,7 @@
     state.entities.set(ent.id, ent);
     ent.layers = ent.layers || { geo: [], sld: [] };
     ent.layers[view].push({ layer, kind });
-    if (kind === "main") {
+    if (kind === "main" || kind === "box") {
       layer.bindTooltip(() => tipHtml(ent), { sticky: true, className: "grid-tip", direction: "top", offset: [0, -10], opacity: 1 });
       layer.on("mouseover", () => hover(ent, view, true));
       layer.on("mouseout", () => hover(ent, view, false));
@@ -381,6 +381,15 @@
 
   function drawSld(m) {
     const g = groups.sld;
+    const structured = state.sldLayout === "auto";
+    for (const s of m.substations) {
+      if (!s.box) continue;
+      const rect = L.rectangle(s.box.map(P), { pane: "boxes", color: "#8b98a8", weight: 1, opacity: 0.5,
+                                               fillColor: "#ffffff", fillOpacity: 0.03, className: "sub-box" });
+      register(s, "sld", rect, "box").addTo(g);
+      L.tooltip({ permanent: true, direction: "left", className: "sub-name", offset: [0, 0], interactive: false })
+        .setLatLng(P(s.label)).setContent(esc(s.name)).addTo(g);
+    }
     for (const s of m.segments) {
       if (!s.dl || s.dl.length < 2) continue;
       const b1 = s.terms[0].bus;
@@ -398,7 +407,7 @@
         : L.circleMarker(P(b.dl[0]), { pane: "buses", radius: 6, color: "#0b0f14", weight: 1.5, fillColor: colorOf(b), fillOpacity: 1 });
       register(b, "sld", layer).addTo(g);
       const right = b.dl.reduce((a, p) => (p[0] > a[0] ? p : a), b.dl[0]);
-      addLabel("sld", P(right), b.sub ? `${b.sub.name} ${fmt(b.kv, 0)}` : b.name, [10, 0]);
+      addLabel("sld", P(right), structured ? `${fmt(b.kv, 0)} kV` : (b.sub ? `${b.sub.name} ${fmt(b.kv, 0)}` : b.name), [6, 0]);
     }
     const equipment = [...m.gens, ...m.loads, ...m.shunts, ...m.trafos];
     for (const e of equipment) {
@@ -419,7 +428,7 @@
     for (const ent of state.entities.values()) {
       for (const view of ["geo", "sld"]) {
         for (const { layer, kind } of (ent.layers && ent.layers[view]) || []) {
-          if (kind === "conn" || kind === "ring") continue;
+          if (kind === "conn" || kind === "ring" || kind === "box") continue;
           if (layer instanceof L.Marker) layer.setIcon(iconFor(ent));
           else if (layer instanceof L.CircleMarker) layer.setStyle({ fillColor: colorOf(ent) });
           else layer.setStyle({ color: colorOf(ent), opacity: state.color === "vpu" && (ent.kind === "line" || ent.kind === "segment") ? 0.55 : 0.95 });
@@ -447,7 +456,7 @@
       return (ent.geo || (sub && sub.geo) || []).slice(0, ent.kind === "substation" ? 1 : undefined);
     }
     if (ent.kind === "line") return ent.segments.flatMap((s) => s.dl || []);
-    if (ent.kind === "substation") return ent.buses.flatMap((b) => b.dl || []);
+    if (ent.kind === "substation") return ent.box || ent.buses.flatMap((b) => b.dl || []);
     return ent.dl || (ent.bus && ent.bus.dl) || [];
   }
   const toLatLngs = (pts, view) => pts.map(view === "geo" ? G : P);
@@ -467,7 +476,7 @@
       : L.featureGroup(lls.length > 1 && ent.kind === "substation" && view === "sld"
           ? [(() => {
               // Fixed margin in diagram units, so single-busbar substations get a visible box too
-              const b = L.latLngBounds(lls), m = 30;
+              const b = L.latLngBounds(lls), m = ent.box ? 8 : 30;
               return L.rectangle([[b.getSouth() - m, b.getWest() - m], [b.getNorth() + m, b.getEast() + m]],
                                  { ...style, weight: 2, fillOpacity: 0.06, fillColor: COLORS.accent });
             })()]
@@ -554,7 +563,11 @@
       const sym = (svg, label) => `<div class="legend-row"><span style="width:26px;display:inline-flex;justify-content:center">${svg}</span>${label}</div>`;
       html += `<div style="margin-top:8px">${sym(ICON.gen(COLORS.gen), "Generator")}${sym(ICON.load(COLORS.load), "Load")}${sym(ICON.cap(COLORS.shunt), "Capacitor")}${sym(ICON.reactor(COLORS.shunt), "Reactor")}${sym(ICON.trafo(COLORS.kv380, COLORS.kv110), "Transformer")}</div>`;
     }
-    if (m.autoLayout && state.view === "sld") html += `<div style="color:var(--gen);margin-top:6px">Automatic layout: the files contain no diagram layout (DL).</div>`;
+    if (state.view === "sld") {
+      html += `<div style="color:var(--muted);margin-top:6px">${state.sldLayout === "auto"
+        ? "Structured single-line diagram generated from the topology; geographic positions are not used."
+        : "Diagram layout from the file (DL profile)."}</div>`;
+    }
     if (m.totals.hasSV) html += `<div style="color:var(--muted);margin-top:6px">Moving dots show the direction of active power flow; faster means higher loading.</div>`;
     $("#legend").innerHTML = html;
   }
@@ -575,13 +588,10 @@
     const m = state.model;
     const pts = view === "geo"
       ? [...m.substations.filter((s) => s.geo).map((s) => s.geo[0]), ...m.lines.flatMap((c) => c.geo || [])]
-      : m.buses.flatMap((b) => b.dl || []);
+      : [...m.buses.flatMap((b) => b.dl || []), ...m.substations.flatMap((s) => s.box || [])];
     if (pts.length) maps[view].fitBounds(L.latLngBounds(toLatLngs(pts, view)).pad(0.05), { paddingBottomRight: [340, 0] });
     state.fitted[view] = true;
-    if (view === "sld") {
-      state.sldFarZoom = sldMap.getZoom() + (m.buses.length > 80 ? 1 : -99);
-      updateSldDetail();
-    }
+    if (view === "sld") updateSldDetail();
   }
 
   function setView(view) {
@@ -592,6 +602,7 @@
     $("#geoMap").classList.toggle("hidden", view !== "geo");
     $("#sldMap").classList.toggle("hidden", view !== "sld");
     $("#basemapField").style.display = view === "geo" ? "" : "none";
+    $("#layoutField").style.display = view === "sld" && state.model.hasFileDiagram ? "" : "none";
     maps[view].invalidateSize();
     if (!state.fitted[view]) fit(view);
     if (state.selected) { zoomTo(state.selected, view); select(state.selected, false); }
@@ -599,11 +610,15 @@
   }
   document.querySelectorAll("#viewSwitch button").forEach((b) => b.addEventListener("click", () => setView(b.dataset.view)));
 
-  // Large diagrams: equipment symbols appear once zoomed in past the overview
+  // Equipment symbols scale with the diagram so they always fit their bays; far out
+  // they are hidden, and in large diagrams the substation names too.
   function updateSldDetail() {
-    $("#sldMap").classList.toggle("sld-far", sldMap.getZoom() < (state.sldFarZoom ?? -99));
+    const scale = Math.pow(2, sldMap.getZoom()), c = $("#sldMap");
+    c.style.setProperty("--eq-scale", Math.min(1.5, Math.max(0.3, scale)).toFixed(3));
+    c.classList.toggle("sld-far", scale < 0.4);
+    c.classList.toggle("sld-names-far", scale < 0.15);
   }
-  sldMap.on("zoomend", updateSldDetail);
+  sldMap.on("zoom zoomend", updateSldDetail);
   for (const map of Object.values(maps)) map.on("click", () => select(null));
   document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") select(null); });
 
@@ -641,9 +656,8 @@
       if (!model.buses.length) throw new Error("No network found (no ConnectivityNode / TopologicalNode objects).");
       show(model);
       const what = `${model.substations.length} substations, ${model.segments.length} circuits from ${model.files.length} file(s)`;
-      toast(model.autoLayout
-        ? `Loaded ${what}. No diagram layout (DL) in the files: showing an automatic schematic layout${model.hasGeo ? "" : "; no geographic data (GL) for the map view"}.`
-        : `Loaded ${what}`, "info", model.autoLayout ? 7000 : 3000);
+      toast(model.hasGeo ? `Loaded ${what}` : `Loaded ${what}. No geographic data (GL) in the files: the map view is not available.`,
+            "info", model.hasGeo ? 3000 : 7000);
     } catch (e) {
       console.error(e);
       toast(`Could not load: ${e.message}`);
@@ -664,7 +678,8 @@
     $("#details").classList.add("hidden");
     document.body.classList.remove("no-model");
     if (m.hasGeo) drawGeo(m);
-    if (m.hasDiagram) drawSld(m);
+    prepareSld(m);
+    drawSld(m);
     for (const v of ["geo", "sld"]) flowLayers[v].addTo(maps[v]);
     document.querySelector('#viewSwitch [data-view="geo"]').disabled = !m.hasGeo;
     document.querySelector('#viewSwitch [data-view="sld"]').disabled = !m.hasDiagram;
@@ -683,6 +698,40 @@
     }
     restyle();
   }
+
+  // --- Schematic layouts: structured (generated) or from the file's DL profile ----------
+  const sldEntities = (m) => [...m.buses, ...m.segments, ...m.gens, ...m.loads, ...m.shunts, ...m.trafos];
+
+  function prepareSld(m) {
+    for (const e of sldEntities(m)) e.dlFile = e.dl;
+    SLD.layout(m);
+    m.hasDiagram = true;
+    state.sldLayout = "auto";
+    $("#sldLayout").value = "auto";
+    applySldLayout(m);
+  }
+
+  function applySldLayout(m) {
+    const auto = state.sldLayout === "auto" || !m.hasFileDiagram;
+    for (const e of sldEntities(m)) e.dl = auto ? e.dlAuto : e.dlFile;
+    for (const s of m.substations) { s.box = auto ? s.boxAuto : null; s.label = auto ? s.labelAuto : null; }
+  }
+
+  function redrawSld() {
+    const m = state.model;
+    groups.sld.clearLayers();
+    labelGroups.sld.clearLayers();
+    sldMap.removeLayer(flowLayers.sld);
+    flowLayers.sld = new FlowLayer("sld");
+    for (const ent of state.entities.values()) if (ent.layers) ent.layers.sld = [];
+    applySldLayout(m);
+    drawSld(m);
+    flowLayers.sld.addTo(sldMap);
+    restyle();
+    fit("sld");
+    drawHalo("sld");
+  }
+  $("#sldLayout").addEventListener("change", (ev) => { state.sldLayout = ev.target.value; if (state.model) redrawSld(); });
 
   async function readFiles(fileList) {
     const files = [];

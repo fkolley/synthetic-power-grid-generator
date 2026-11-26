@@ -171,7 +171,7 @@
       }
     }
     store.finish();
-    return buildModelWithLayout(store);
+    return buildModel(store);
   }
 
   // ---------------------------------------------------------------------------
@@ -413,105 +413,9 @@
       substations: [...substations.values()], buses: [...buses.values()], lines: [...corridors.values()],
       segments, trafos, gens, loads, shunts, totals,
       hasGeo: [...substations.values()].some((s) => s.geo) || [...corridors.values()].some((c) => c.geo),
-      hasDiagram: [...buses.values()].some((b) => b.dl),
+      hasFileDiagram: [...buses.values()].some((b) => b.dl),
     };
   }
 
-  // ---------------------------------------------------------------------------
-  // Automatic schematic layout for models without a DL profile
-  // ---------------------------------------------------------------------------
-
-  /** Force-directed (Fruchterman-Reingold) placement of substations, then buses,
-   *  equipment and parallel circuits arranged around them like a diagram layout. */
-  function autoLayout(model) {
-    // Nodes: substations, plus buses that belong to none
-    const nodeOf = new Map();
-    const nodes = [];
-    for (const b of model.buses) {
-      const key = b.sub ? b.sub.id : b.id;
-      if (!nodeOf.has(key)) { nodeOf.set(key, nodes.length); nodes.push({ key, buses: [] }); }
-      nodes[nodeOf.get(key)].buses.push(b);
-    }
-    const n = nodes.length;
-    const edges = new Set();
-    const nodeIdx = (bus) => nodeOf.get(bus.sub ? bus.sub.id : bus.id);
-    for (const c of model.lines) {
-      const a = nodeIdx(c.bus1), b = nodeIdx(c.bus2);
-      if (a !== b) edges.add(a < b ? `${a},${b}` : `${b},${a}`);
-    }
-    const E = [...edges].map((e) => e.split(",").map(Number));
-
-    // Deterministic start on a spiral, then FR iterations
-    const area = n * 140 * 140, k = Math.sqrt(area / Math.max(1, n));
-    const pos = nodes.map((_, i) => { const r = 12 * Math.sqrt(i), a = i * 2.39996; return [r * Math.cos(a) * k / 12, r * Math.sin(a) * k / 12]; });
-    const iterations = n > 800 ? 120 : 260;
-    let temp = Math.sqrt(area) / 8;
-    for (let it = 0; it < iterations; it++) {
-      const disp = pos.map(() => [0, 0]);
-      for (let i = 0; i < n; i++) {
-        for (let j = i + 1; j < n; j++) {
-          let dx = pos[i][0] - pos[j][0], dy = pos[i][1] - pos[j][1];
-          const d2 = dx * dx + dy * dy || 0.01, f = (k * k) / d2;
-          dx *= f; dy *= f;
-          disp[i][0] += dx; disp[i][1] += dy; disp[j][0] -= dx; disp[j][1] -= dy;
-        }
-      }
-      for (const [a, b] of E) {
-        const dx = pos[a][0] - pos[b][0], dy = pos[a][1] - pos[b][1], d = Math.hypot(dx, dy) || 0.01, f = d / k;
-        disp[a][0] -= dx * f; disp[a][1] -= dy * f; disp[b][0] += dx * f; disp[b][1] += dy * f;
-      }
-      for (let i = 0; i < n; i++) {
-        const d = Math.hypot(disp[i][0], disp[i][1]) || 0.01, s = Math.min(d, temp) / d;
-        pos[i][0] += disp[i][0] * s; pos[i][1] += disp[i][1] * s;
-      }
-      temp *= 0.985;
-    }
-
-    // Buses: highest voltage up-right of the lower ones, as in the generated DL
-    const busXY = new Map();
-    nodes.forEach((node, i) => {
-      node.buses.sort((a, b) => num(a.kv) - num(b.kv)).forEach((b, j) => {
-        const xy = [pos[i][0] + 40 * j, pos[i][1] - 40 * j];
-        busXY.set(b.id, xy);
-        b.dl = [[xy[0] - 15, xy[1]], [xy[0] + 15, xy[1]]];
-      });
-    });
-    for (const c of model.lines) {
-      const a = busXY.get(c.bus1.id), b = busXY.get(c.bus2.id);
-      const len = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1, nx = -(b[1] - a[1]) / len, ny = (b[0] - a[0]) / len;
-      c.segments.forEach((s, idx) => {
-        const off = (idx - (c.segments.length - 1) / 2) * 6;
-        s.dl = [[a[0] + nx * off, a[1] + ny * off], [b[0] + nx * off, b[1] + ny * off]];
-      });
-    }
-    const slots = new Map();
-    const slot = (bus, kind) => {
-      const key = bus.id + kind, s = slots.get(key) || 0;
-      slots.set(key, s + 1);
-      const [x, y] = busXY.get(bus.id), [dx, dy] = { gen: [0, -22], load: [0, 22], shunt: [24, 8] }[kind];
-      return [x + dx + 10 * s, y + dy];
-    };
-    for (const g of model.gens) g.dl = [slot(g.bus, "gen")];
-    for (const l of model.loads) l.dl = [slot(l.bus, "load")];
-    for (const s of model.shunts) s.dl = [slot(s.bus, "shunt")];
-    const trafoCount = new Map();
-    for (const t of model.trafos) {
-      const a = busXY.get(t.terms[0].bus.id), b = busXY.get(t.terms[1].bus.id), key = t.terms[0].bus.id + t.terms[1].bus.id;
-      const k2 = trafoCount.get(key) || 0;
-      trafoCount.set(key, k2 + 1);
-      t.dl = [[(a[0] + b[0]) / 2 + 8 * k2, (a[1] + b[1]) / 2]];
-    }
-    for (const sub of model.substations) sub.dl = sub.buses[0] && sub.buses[0].dl;
-    model.hasDiagram = true;
-    model.autoLayout = true;
-  }
-
-  const _buildModel = buildModel;
-  function buildModelWithLayout(store) {
-    const model = _buildModel(store);
-    if (!model.hasDiagram && model.buses.length) autoLayout(model);
-    return model;
-  }
-
-  global.CIM = { loadFiles, buildModel: buildModelWithLayout, autoLayout, Store, normId };
+  global.CIM = { loadFiles, buildModel, Store, normId };
 })(window);

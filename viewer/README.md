@@ -1,8 +1,9 @@
 # Grid Viewer
 
 A single-page web app for viewing CIM / CGMES power grid models: a geographic view on
-a map and a schematic single-line diagram, with hover details, search and power-flow
-results. It runs entirely in the browser; nothing is uploaded.
+a map and a structured single-line diagram in the style of EMS / SCADA overview
+displays, with hover details, search and power-flow results. It runs entirely in the
+browser; nothing is uploaded.
 
 ## Run
 
@@ -35,7 +36,24 @@ What is shown depends on the profiles present:
 | TP / SV | Bus voltages, branch flows, loading, losses |
 | SSH | Setpoints and dispatch when there is no SV |
 | GL | Geographic view (WGS84 positions on the map) |
-| DL | Schematic view; without DL an automatic force-directed layout is used |
+| DL | Optional alternative schematic ("Diagram: From file"); not needed for the default view |
+
+## Schematic view
+
+The default schematic is generated from the network topology alone; geographic
+positions and file diagram layouts are ignored:
+
+* Each substation is a box with its voltage levels as stacked horizontal busbars
+  (highest voltage on top), transformers as vertical bays between them, and
+  generators, loads and shunts as feeder bays.
+* Substations are placed on an aligned grid (force-directed placement on the
+  substation graph, snapped to grid cells, refined by local swaps that shorten the
+  connections; columns and rows sized to their boxes).
+* Lines are routed orthogonally (A* on a routing grid) around boxes and labels, with
+  penalties for bends and overlaps so parallel lines spread over the channels. Line
+  bays are ordered by the position of the remote substation to reduce crossings.
+
+If the files contain a DL profile, **Diagram: From file (DL)** shows that layout instead.
 
 ## Features
 
@@ -49,5 +67,6 @@ What is shown depends on the profiles present:
 ## Files
 
 * `index.html`, `style.css`: page and styling
-* `cim.js`: RDF/XML parsing (CGMES and CIM17), network model, automatic layout
+* `cim.js`: RDF/XML parsing (CGMES and CIM17), network model
+* `sld-layout.js`: structured single-line diagram layout and orthogonal line routing
 * `app.js`: rendering (Leaflet), interaction, colour modes, flow animation
