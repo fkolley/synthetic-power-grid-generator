@@ -1,0 +1,98 @@
+# Germany-scale grid: high voltage (110 kV) and extra-high voltage (380 kV).
+#
+#   python synthetic_cim_generator.py --params params/germany_hv_ehv.toml
+#
+# Synthetic, not a model of the real grid: it reproduces the size and the main
+# aggregate figures of the German high and extra-high voltage system, but no real
+# substation, line or power plant.
+#
+# How the parameters compare (model output for seed 2026; reference values rounded
+# and approximate; the number of 110 kV substations is an order-of-magnitude estimate):
+#
+#   Figure                          Model          Germany (approx.)
+#   Area                            356,600 km2    357,600 km2
+#   110 kV substations              4,000          several thousand (estimate)
+#   380/110 kV supply points        350            a few hundred
+#   220/380 kV circuit length       37,100 km      ~37,000 km
+#   110 kV circuit length           73,400 km      ~95,000 km
+#   Load                            74 GW          peak ~80 GW
+#
+# The 110 kV circuit length is about 23 % short: the model has no cables, no
+# four-circuit lines and no 110 kV lines between grid groups. 220 kV is not modelled
+# separately; the 380 kV level stands for the whole transmission grid.
+#
+# Resources: planning takes about 20 s. Writing and verifying the full model takes
+# much longer and several GB of memory (about 250,000 CIM objects). The N-1 report
+# is off, because it would take hours for about 10,000 circuits.
+
+[grid]
+buses = 4000                  # 110 kV substations
+generators = 800              # 320 at 380 kV (backbone_share), 480 at 110 kV
+loads = "all"
+voltage_kv = 110
+backbone_voltage_kv = 380
+backbone_buses = 350          # 380/110 kV supply points
+seed = 2026
+
+[output]
+format = "both"
+cim17 = "germany_hv_ehv.cim.xml"
+cgmes = "germany_hv_ehv_CGMES.zip"
+n1_report = false             # hours at this size
+
+[geography]
+spacing_km = 4.73             # gives a 598 km x 598 km area, the size of Germany
+origin = [51.16, 10.45]       # geographic centre of Germany
+urban_share = 0.6
+sites_per_town = 15           # about 270 towns
+town_sigma = 1.6
+min_site_separation = 0.35
+routing_factor = 1.15
+
+[topology]
+avg_degree = 2.4
+ring_size = [5, 20]
+preferred_min_ring = 6
+ring_link_max = 3.0
+stub_link_max = 3.5
+max_stub_depth = 2
+stub_tip_penalty = 0.35
+line_clearance = 0.3
+
+[backbone]
+avg_degree = 2.8              # matches the ~37,000 km transmission circuit length
+buses_per_site = 11.4         # only used if backbone_buses is removed
+
+[lines]
+circuits_per_corridor = 2
+max_circuits = 4
+
+[transformers]
+min_per_site = 2
+max_per_site = 8
+margin = 1.4
+
+[loads]
+mw_range = [5.0, 30.0]        # 4,000 substations x ~18.5 MW = ~74 GW
+q_ratio = [0.1, 0.4]
+urban_factor = 1.3
+rural_factor = 0.75
+
+[generation]
+backbone_share = 0.4          # large plants at 380 kV, smaller and renewable plants at 110 kV
+backbone_unit_mva = [400.0, 1100.0]
+regional_unit_mva = [10.0, 150.0]
+fleet_loading = [0.5, 0.8]
+rated_power_factor = 0.85
+loss_allowance = 0.03
+backbone_vm_pu = [1.03, 1.045]
+regional_vm_pu = [1.02, 1.035]
+
+[compensation]
+capacitor_share = 0.8
+reactor_share = 0.75
+min_mvar = 1.0
+
+[planning]
+dc_loading_target = 0.7
+n1_corridor_loading = 0.9

@@ -203,6 +203,14 @@ def clustered_sites(n: int, spacing_km: float, rng: random.Random) -> Tuple[List
     min_sep = MIN_SITE_SEPARATION * spacing_km
     pos: List[Tuple[float, float]] = []
     kind: List[str] = []
+    cell = max(min_sep, 1e-6)
+    buckets: Dict[Tuple[int, int], List[Tuple[float, float]]] = {}
+
+    def separated(p) -> bool:
+        cx, cy = int(p[0] // cell), int(p[1] // cell)
+        return all(math.dist(p, q) >= min_sep
+                   for dx in (-1, 0, 1) for dy in (-1, 0, 1) for q in buckets.get((cx + dx, cy + dy), ()))
+
     while len(pos) < n:
         for _attempt in range(60):
             if rng.random() < URBAN_SHARE:
@@ -212,10 +220,11 @@ def clustered_sites(n: int, spacing_km: float, rng: random.Random) -> Tuple[List
             else:
                 p, k = (rng.uniform(0, side), rng.uniform(0, side)), "rural"
             p = (min(side, max(0.0, p[0])), min(side, max(0.0, p[1])))
-            if all(math.dist(p, q) >= min_sep for q in pos):
+            if separated(p):
                 break
         pos.append(p)
         kind.append(k)
+        buckets.setdefault((int(p[0] // cell), int(p[1] // cell)), []).append(p)
     return pos, kind
 
 
@@ -313,19 +322,43 @@ def build_regional_grid(pos, groups: List[List[int]], leaf_budget: int, spacing_
 
     G = nx.Graph()
     G.add_nodes_from(range(n))
-    for nodes in members:
-        G.add_edges_from(_mst_edges(nodes, pos), kind="tree")
-    tree_lengths = sorted(math.dist(pos[a], pos[b]) for a, b in G.edges()) or [spacing_km]
+    tree = [e for nodes in members for e in _mst_edges(nodes, pos)]
+    tree_lengths = sorted(math.dist(pos[a], pos[b]) for a, b in tree) or [spacing_km]
     l_med = tree_lengths[len(tree_lengths) // 2]
     clearance = LINE_CLEARANCE * spacing_km
     dist = lambda a, b: math.dist(pos[a], pos[b])  # noqa: E731
 
+    # Spatial index (grid buckets) so crossing / clearance checks only look at nearby
+    # corridors and substations: two segments can only cross if their bounding boxes overlap.
+    cell = max(l_med, clearance, 1e-6)
+    node_cells: Dict[Tuple[int, int], List[int]] = {}
+    edge_cells: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+    for i, p in enumerate(pos):
+        node_cells.setdefault((int(p[0] // cell), int(p[1] // cell)), []).append(i)
+
+    def cells(p, q, pad=0.0):
+        x0, x1 = sorted((p[0], q[0]))
+        y0, y1 = sorted((p[1], q[1]))
+        return [(cx, cy) for cx in range(int((x0 - pad) // cell), int((x1 + pad) // cell) + 1)
+                for cy in range(int((y0 - pad) // cell), int((y1 + pad) // cell) + 1)]
+
+    def add(u, v, kind):
+        G.add_edge(u, v, kind=kind)
+        for c in cells(pos[u], pos[v]):
+            edge_cells.setdefault(c, []).append((u, v))
+
+    for a, b in tree:
+        add(a, b, "tree")
+
     def geometry_ok(u, v) -> bool:
         pu, pv = pos[u], pos[v]
-        for a, b in G.edges():
-            if _segments_cross(pu, pv, pos[a], pos[b]):
-                return False
-        return all(_point_segment_distance(pos[w], pu, pv) >= clearance for w in range(n) if w not in (u, v))
+        near = cells(pu, pv, clearance)
+        for c in near:
+            for a, b in edge_cells.get(c, ()):
+                if _segments_cross(pu, pv, pos[a], pos[b]):
+                    return False
+        return all(_point_segment_distance(pos[w], pu, pv) >= clearance
+                   for c in near for w in node_cells.get(c, ()) if w not in (u, v))
 
     def close(nodes, sup, ring_size, link_max, sources=None, bonus_supply=True):
         """Best ring-closing corridor for the given sources (all nodes if None), or None."""
@@ -372,7 +405,7 @@ def build_regional_grid(pos, groups: List[List[int]], leaf_budget: int, spacing_
             e = close(nodes, sup, RING_SIZE, RING_LINK_MAX)
             if e is None:
                 break
-            G.add_edge(*e, kind="ring")
+            add(*e, "ring")
             added["ring"] += 1
         # Stubs may hang at most MAX_STUB_DEPTH substations off the ring / supply point
         for _ in range(len(nodes)):
@@ -384,7 +417,7 @@ def build_regional_grid(pos, groups: List[List[int]], leaf_budget: int, spacing_
             e = close(nodes, sup, (4, RING_SIZE[1] + 5), STUB_LINK_MAX, sources=[tip], bonus_supply=False)
             if e is None:
                 break
-            G.add_edge(*e, kind="ring")
+            add(*e, "ring")
             added["stub"] += 1
 
     # Every stub end needs a load: close the deepest stub ends if there are not enough loads
@@ -403,7 +436,7 @@ def build_regional_grid(pos, groups: List[List[int]], leaf_budget: int, spacing_
              or close(nodes, groups[group_of[tip]], (3, n), float("inf"), sources=[tip], bonus_supply=False))
         if e is None:
             break
-        G.add_edge(*e, kind="ring")
+        add(*e, "ring")
         added["leaf"] += 1
 
     for a, b in G.edges():
@@ -417,7 +450,8 @@ def topology_metrics(G: nx.Graph, group_of: Sequence[int], supplies: Sequence[in
     """Structural statistics of the 110 kV corridor graph (corridors, not circuits)."""
     n = G.number_of_nodes()
     deg = [d for _, d in G.degree()]
-    cycles = sorted(len(c) for c in nx.minimum_cycle_basis(G)) if G.number_of_edges() else []
+    cycles = sorted(len(c) for comp in nx.connected_components(G) if len(comp) > 2
+                    for c in nx.minimum_cycle_basis(G.subgraph(comp)))
     lengths = sorted(d["length_km"] for *_, d in G.edges(data=True)) or [0.0]
     supply = set(supplies)
     leaves = [v for v in G.nodes if G.degree(v) == 1 and v not in supply]
@@ -437,11 +471,15 @@ def topology_metrics(G: nx.Graph, group_of: Sequence[int], supplies: Sequence[in
 def spread_sites(pos: Sequence[Tuple[float, float]], n: int, rng: random.Random) -> List[int]:
     """Pick n sites spread over the area (randomised farthest-point sampling)."""
     chosen = [rng.randrange(len(pos))]
+    taken = {chosen[0]}
+    far = [math.dist(p, pos[chosen[0]]) for p in pos]       # distance to the nearest chosen site
     while len(chosen) < n:
-        remaining = [i for i in range(len(pos)) if i not in chosen]
-        far = {i: min(math.dist(pos[i], pos[c]) for c in chosen) for i in remaining}
-        best = max(far.values())
-        chosen.append(rng.choice(sorted(i for i in remaining if far[i] >= 0.8 * best)))
+        remaining = [i for i in range(len(pos)) if i not in taken]
+        best = max(far[i] for i in remaining)
+        c = rng.choice([i for i in remaining if far[i] >= 0.8 * best])
+        chosen.append(c)
+        taken.add(c)
+        far = [min(f, math.dist(p, pos[c])) for f, p in zip(far, pos)]
     return chosen
 
 
@@ -453,13 +491,18 @@ def place_generators(G: nx.Graph, n_gens: int, rng: random.Random,
     if n_gens == 0:
         return []
     pool = sorted(candidates if candidates is not None else G.nodes)
-    hops = dict(nx.all_pairs_shortest_path_length(G))
     chosen = [rng.choice(pool)]
+    taken = {chosen[0]}
+    far = dict(nx.single_source_shortest_path_length(G, chosen[0]))   # hops to the nearest chosen node
     while len(chosen) < n_gens:
-        remaining = [b for b in pool if b not in chosen]
-        far = {b: min(hops[b][c] for c in chosen) for b in remaining}
-        best = max(far.values())
-        chosen.append(rng.choice([b for b in remaining if far[b] >= best - 1]))
+        remaining = [b for b in pool if b not in taken]
+        best = max(far.get(b, math.inf) for b in remaining)
+        c = rng.choice([b for b in remaining if far.get(b, math.inf) >= best - 1])
+        chosen.append(c)
+        taken.add(c)
+        for b, d in nx.single_source_shortest_path_length(G, c).items():
+            if d < far.get(b, math.inf):
+                far[b] = d
     return chosen
 
 
@@ -530,18 +573,20 @@ MAX_TRANSFORMERS_PER_SITE = 8
 
 
 def dc_flows(n_bus: int, branches: List[Branch], injection_mw: Sequence[float], slack_bus: int) -> List[float]:
-    """DC power flow. Returns the total MW flow on each branch (all circuits)."""
-    B = np.zeros((n_bus, n_bus))
+    """DC power flow (sparse). Returns the total MW flow on each branch (all circuits)."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.linalg import spsolve
+    rows, cols, vals = [], [], []
     for br in branches:
         y = br.circuits / br.x_pu
-        B[br.u, br.u] += y
-        B[br.v, br.v] += y
-        B[br.u, br.v] -= y
-        B[br.v, br.u] -= y
-    keep = [b for b in range(n_bus) if b != slack_bus]
+        rows += [br.u, br.v, br.u, br.v]
+        cols += [br.u, br.v, br.v, br.u]
+        vals += [y, y, -y, -y]
+    B = coo_matrix((vals, (rows, cols)), shape=(n_bus, n_bus)).tocsr()
+    keep = np.array([b for b in range(n_bus) if b != slack_bus])
     theta = np.zeros(n_bus)
     p = np.asarray(injection_mw, dtype=float) / S_BASE_MVA
-    theta[keep] = np.linalg.solve(B[np.ix_(keep, keep)], p[keep])
+    theta[keep] = spsolve(B[keep][:, keep].tocsc(), p[keep])
     return [(theta[br.u] - theta[br.v]) * br.circuits / br.x_pu * S_BASE_MVA for br in branches]
 
 
@@ -1009,7 +1054,166 @@ def create_synthetic_cim(**kwargs):
 SCENARIO_TIME = datetime.datetime(2025, 1, 15, 11, 30, tzinfo=datetime.timezone.utc)  # winter weekday
 
 
+# ---------------------------------------------------------------------------
+# Parameter files (TOML)
+# ---------------------------------------------------------------------------
+
+def _number(v):
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise ValueError("expected a number")
+    return float(v)
+
+
+def _integer(v):
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise ValueError("expected an integer")
+    return v
+
+
+def _pair(convert):
+    def conv(v):
+        if not isinstance(v, list) or len(v) != 2:
+            raise ValueError("expected a list of two values, e.g. [1, 2]")
+        a, b = convert(v[0]), convert(v[1])
+        if a > b:
+            raise ValueError("first value must not be larger than the second")
+        return (a, b)
+    return conv
+
+
+def _boolean(v):
+    if not isinstance(v, bool):
+        raise ValueError("expected true or false")
+    return v
+
+
+def _text(v):
+    if not isinstance(v, str):
+        raise ValueError("expected a string")
+    return v
+
+
+def _loads(v):
+    if v == "all":
+        return None
+    return _integer(v)
+
+
+def _origin(v):
+    lat, lon = (_number(x) for x in (v if isinstance(v, list) and len(v) == 2 else [None, None]))
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        raise ValueError("expected [latitude, longitude]")
+    return (lat, lon)
+
+
+def _output_format(v):
+    if v not in ("both", "cim17", "cgmes"):
+        raise ValueError('expected "both", "cim17" or "cgmes"')
+    return v
+
+
+# (section, key) -> (command-line option, converter); command-line arguments override these
+PARAM_OPTIONS = {
+    ("grid", "buses"): ("buses", _integer),
+    ("grid", "generators"): ("gens", _integer),
+    ("grid", "loads"): ("loads", _loads),
+    ("grid", "voltage_kv"): ("voltage", _number),
+    ("grid", "backbone_voltage_kv"): ("backbone_voltage", _number),
+    ("grid", "backbone_buses"): ("backbone_buses", _integer),
+    ("grid", "seed"): ("seed", _integer),
+    ("output", "format"): ("format", _output_format),
+    ("output", "cim17"): ("output", _text),
+    ("output", "cgmes"): ("cgmes_output", _text),
+    ("output", "n1_report"): ("skip_n1", lambda v: not _boolean(v)),
+}
+
+# (section, key) -> (module constant, converter) or ((constant, dict key), converter)
+PARAM_CONSTANTS = {
+    ("geography", "spacing_km"): ("SPACING_KM_110", _number),
+    ("geography", "origin"): ("GEO_ORIGIN", _origin),
+    ("geography", "urban_share"): ("URBAN_SHARE", _number),
+    ("geography", "sites_per_town"): ("SITES_PER_TOWN", _number),
+    ("geography", "town_sigma"): ("TOWN_SIGMA", _number),
+    ("geography", "min_site_separation"): ("MIN_SITE_SEPARATION", _number),
+    ("geography", "routing_factor"): ("ROUTING_FACTOR", _number),
+    ("topology", "avg_degree"): ("AVG_DEGREE_110", _number),
+    ("topology", "ring_size"): ("RING_SIZE", _pair(_integer)),
+    ("topology", "preferred_min_ring"): ("PREFERRED_MIN_RING", _integer),
+    ("topology", "ring_link_max"): ("RING_LINK_MAX", _number),
+    ("topology", "stub_link_max"): ("STUB_LINK_MAX", _number),
+    ("topology", "max_stub_depth"): ("MAX_STUB_DEPTH", _integer),
+    ("topology", "stub_tip_penalty"): ("STUB_TIP_PENALTY", _number),
+    ("topology", "line_clearance"): ("LINE_CLEARANCE", _number),
+    ("backbone", "avg_degree"): ("BACKBONE_AVG_DEGREE", _number),
+    ("backbone", "buses_per_site"): ("BUSES_PER_BACKBONE_SITE", _number),
+    ("lines", "circuits_per_corridor"): ("CIRCUITS_PER_CORRIDOR", _integer),
+    ("lines", "max_circuits"): ("MAX_LINE_CIRCUITS", _integer),
+    ("transformers", "min_per_site"): ("MIN_TRANSFORMERS_PER_SITE", _integer),
+    ("transformers", "max_per_site"): ("MAX_TRANSFORMERS_PER_SITE", _integer),
+    ("transformers", "margin"): ("TRANSFORMER_MARGIN", _number),
+    ("loads", "mw_range"): ("LOAD_MW_RANGE", _pair(_number)),
+    ("loads", "q_ratio"): ("LOAD_Q_RATIO", _pair(_number)),
+    ("loads", "urban_factor"): (("LOAD_FACTOR", "urban"), _number),
+    ("loads", "rural_factor"): (("LOAD_FACTOR", "rural"), _number),
+    ("generation", "backbone_share"): ("BACKBONE_GEN_SHARE", _number),
+    ("generation", "backbone_unit_mva"): (("UNIT_MVA", "backbone"), _pair(_number)),
+    ("generation", "regional_unit_mva"): (("UNIT_MVA", "regional"), _pair(_number)),
+    ("generation", "fleet_loading"): ("FLEET_LOADING", _pair(_number)),
+    ("generation", "rated_power_factor"): ("RATED_POWER_FACTOR", _number),
+    ("generation", "loss_allowance"): ("LOSS_ALLOWANCE", _number),
+    ("generation", "backbone_vm_pu"): (("GEN_VM_PU", "backbone"), _pair(_number)),
+    ("generation", "regional_vm_pu"): (("GEN_VM_PU", "regional"), _pair(_number)),
+    ("compensation", "capacitor_share"): ("CAP_COMPENSATION", _number),
+    ("compensation", "reactor_share"): ("REACTOR_COMPENSATION", _number),
+    ("compensation", "min_mvar"): ("MIN_SHUNT_MVAR", _number),
+    ("planning", "dc_loading_target"): ("DC_LOADING_TARGET", _number),
+    ("planning", "n1_corridor_loading"): ("N1_CORRIDOR_LOADING", _number),
+}
+
+
+def load_parameter_file(path: str) -> Tuple[Dict, Dict]:
+    """Read a TOML parameter file. Returns (command-line defaults, module constants).
+    Raises ValueError with the file name and key for unknown or invalid entries."""
+    import tomllib
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    sections = sorted({sec for sec, _ in list(PARAM_OPTIONS) + list(PARAM_CONSTANTS)})
+    options, constants = {}, {}
+    for section, entries in data.items():
+        if not isinstance(entries, dict):
+            raise ValueError(f"{path}: '{section}' must be a [section]; sections: {', '.join(sections)}")
+        for key, value in entries.items():
+            spec = PARAM_OPTIONS.get((section, key)) or PARAM_CONSTANTS.get((section, key))
+            if spec is None:
+                known = sorted(k for s, k in list(PARAM_OPTIONS) + list(PARAM_CONSTANTS) if s == section)
+                hint = f"known keys: {', '.join(known)}" if known else f"sections: {', '.join(sections)}"
+                raise ValueError(f"{path}: unknown parameter [{section}] {key}; {hint}")
+            target, convert = spec
+            try:
+                converted = convert(value)
+            except (ValueError, TypeError) as e:
+                raise ValueError(f"{path}: [{section}] {key} = {value!r}: {e}") from None
+            (options if (section, key) in PARAM_OPTIONS else constants)[target] = converted
+    return options, constants
+
+
+def apply_constants(constants: Dict) -> None:
+    """Override module constants, e.g. {"SPACING_KM_110": 5.0, ("LOAD_FACTOR", "urban"): 1.2}."""
+    module = globals()
+    for target, value in constants.items():
+        if isinstance(target, tuple):
+            name, key = target
+            module[name] = {**module[name], key: value}
+        else:
+            module[target] = value
+
+
 def main():
+    # A parameter file supplies defaults; explicit command-line arguments override it.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--params")
+    params_path = pre.parse_known_args()[0].params
+
     parser = argparse.ArgumentParser(description="Synthetic CIM/CGMES power grid generator "
                                                  "(German/European defaults)")
     parser.add_argument("--buses", type=int, default=40, help="Number of lower-level (110 kV) buses / substations")
@@ -1030,6 +1234,15 @@ def main():
                         help="CGMES zip output path (default: <output stem>_CGMES.zip)")
     parser.add_argument("--skip-n1", action="store_true",
                         help="Skip the N-1 contingency report (saves time on large grids)")
+    parser.add_argument("--params", type=str, default=None,
+                        help="TOML parameter file (see params/); command-line arguments override it")
+    if params_path:
+        try:
+            options, constants = load_parameter_file(params_path)
+        except (OSError, ValueError) as e:
+            parser.error(str(e))
+        apply_constants(constants)
+        parser.set_defaults(**options)
     args = parser.parse_args()
 
     n_backbone = default_backbone_buses(args.buses) if args.backbone_buses is None else args.backbone_buses
@@ -1046,6 +1259,8 @@ def main():
         levels = f"{args.backbone_voltage:g}/{args.voltage:g} kV, {n_backbone} backbone buses"
     description = (f"Synthetic grid {args.buses} buses {args.gens} gens {args.loads} loads "
                    f"{levels} seed {args.seed}")
+    if params_path:
+        print(f"Parameters: {params_path}")
     print(f"Generating synthetic grid: {args.buses} buses, {args.gens} gens, {args.loads} loads "
           f"@ {levels}, {FREQUENCY_HZ:g} Hz (seed={args.seed})")
     plan, built, state = generate(

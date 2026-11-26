@@ -132,11 +132,46 @@ python synthetic_cim_generator.py --backbone-voltage 220
 | `--format` | `both` | `cim17`, `cgmes` or `both` |
 | `--output` | `synthetic_grid.cim.xml` | CIM17 output path |
 | `--cgmes-output` | `<output stem>_CGMES.zip` | CGMES output path |
+| `--params` | none | TOML parameter file (see below) |
 
 Grids from a few buses up to several hundred substations have been tested. Topology
 planning takes about a second even for 400 substations. Most of the runtime is
 verification, and the N-1 report is the largest part of it: a 400-substation grid takes
 about 3.3 minutes with both output formats, or about 35 seconds with `--skip-n1`.
+
+## Parameter files
+
+All settings, including the model constants that have no command-line option, can be
+kept in a TOML parameter file:
+
+```bash
+python synthetic_cim_generator.py --params params/small_grid.toml
+python synthetic_cim_generator.py --params params/small_grid.toml --seed 3   # command line wins
+```
+
+Two commented sample files are included. Both list every parameter, so they double as
+templates:
+
+| File | Grid |
+|---|---|
+| [params/small_grid.toml](params/small_grid.toml) | 15 substations at 110 kV with two 380 kV supply points. Runs in seconds; for tests, demos and teaching. |
+| [params/germany_hv_ehv.toml](params/germany_hv_ehv.toml) | Germany-scale grid: 4,000 substations at 110 kV, 350 supply points at 380 kV, the area of Germany, 220/380 kV circuit length of about 37,000 km and about 74 GW of load. The file compares the model with national figures. |
+
+The file is organised in sections:
+
+| Section | Contents |
+|---|---|
+| `[grid]` | Size, voltages, number of supply points, seed (the command-line options) |
+| `[output]` | Format, file names, N-1 report on or off |
+| `[geography]` | Substation spacing, map origin, town clustering, line routing |
+| `[topology]` | 110 kV ring-and-stub rules (see [docs/topology.md](docs/topology.md)) |
+| `[backbone]` | 380 kV mesh density |
+| `[lines]`, `[transformers]` | Circuits per corridor, transformer counts and margins |
+| `[loads]`, `[generation]` | Load sizes, unit sizes, dispatch, voltage setpoints |
+| `[compensation]`, `[planning]` | Shunt compensation, reinforcement limits |
+
+Values not set in the file keep their defaults. Unknown keys and invalid values are
+reported with the file name, section and key.
 
 ## N-1 contingency analysis
 
@@ -205,7 +240,7 @@ and animated power flows.
 ## Requirements
 
 - Python 3.10+
-- `cim-graph`, `networkx`, `numpy` (required)
+- `cim-graph`, `networkx`, `numpy`, `scipy` (required)
 - `pandapower` (optional): AC power flow, used for verification and the SV profile
 - `pypowsybl` (optional): CGMES import check; needs a Java-capable platform
 
@@ -223,6 +258,7 @@ corresponding checks are skipped.
 | `viewer/` | Browser-based grid viewer (map and single-line diagram) |
 | `docs/topology.md` | Technical description of the topology generation |
 | `docs/topology-decisions.md` | Decision log for the topology design, with reasoning and validation |
+| `params/` | Sample parameter files (small grid, Germany-scale grid) |
 
 ## Conventions
 

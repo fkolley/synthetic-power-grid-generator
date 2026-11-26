@@ -1,0 +1,80 @@
+# Small grid: 15 substations at 110 kV, two of them with a 380 kV supply point.
+#
+#   python synthetic_cim_generator.py --params params/small_grid.toml
+#
+# Useful for quick tests, demos and teaching: generates in a few seconds, and the
+# schematic and the map are readable at a glance. Command-line arguments override
+# any value in this file. All values below are the generator's defaults except
+# those in [grid] and [output].
+
+[grid]
+buses = 15                    # 110 kV substations
+generators = 4                # about half on the 380 kV level (backbone_share)
+loads = "all"                 # one load per 110 kV substation, or a number
+voltage_kv = 110              # lower voltage level
+backbone_voltage_kv = 380     # upper voltage level
+backbone_buses = 2            # 380/110 kV supply points; 0 builds a single-level grid
+seed = 6
+
+[output]
+format = "both"               # "both", "cim17" or "cgmes"
+cim17 = "small_grid.cim.xml"
+cgmes = "small_grid_CGMES.zip"
+n1_report = true              # N-1 contingency report in the CIM17 verification
+
+[geography]
+spacing_km = 12.0             # typical distance between neighbouring 110 kV substations
+origin = [51.0, 10.0]         # [latitude, longitude] of the area centre
+urban_share = 0.6             # share of substations placed around towns
+sites_per_town = 15           # substations per town centre
+town_sigma = 1.6              # town radius, in units of spacing_km
+min_site_separation = 0.35    # minimum substation distance, in units of spacing_km
+routing_factor = 1.15         # line length / straight-line distance
+
+[topology]                    # 110 kV ring-and-stub grid groups (docs/topology.md)
+avg_degree = 2.4              # target 2 x corridors / substations per grid group
+ring_size = [5, 20]           # substations per ring created by a ring-closing corridor
+preferred_min_ring = 6        # smaller rings are penalised
+ring_link_max = 3.0           # max ring-closing corridor length / median tree corridor
+stub_link_max = 3.5           # same, for corridors that close an overly long stub
+max_stub_depth = 2            # max substations on a stub (Stichleitung)
+stub_tip_penalty = 0.35       # score factor for ring corridors ending at a stub end
+line_clearance = 0.3          # min distance of a new corridor from other substations (x spacing_km)
+
+[backbone]                    # 380 kV transmission grid
+avg_degree = 2.8              # 2 x corridors / supply points (meshed)
+buses_per_site = 8            # default supply points = buses / this (if backbone_buses is not set)
+
+[lines]
+circuits_per_corridor = 2     # double-circuit overhead lines
+max_circuits = 4              # upper limit for reinforcement
+
+[transformers]                # 300 MVA 380/110 kV units
+min_per_site = 2              # N-1 at every supply point
+max_per_site = 8
+margin = 1.4                  # installed MVA / net demand of the supply area
+
+[loads]
+mw_range = [5.0, 45.0]        # active power per 110 kV substation (MW)
+q_ratio = [0.1, 0.4]          # reactive / active power
+urban_factor = 1.3            # load multiplier for urban substations
+rural_factor = 0.75           # load multiplier for rural substations
+
+[generation]
+backbone_share = 0.5          # share of generators connected at 380 kV
+backbone_unit_mva = [400.0, 1100.0]   # relative unit sizes before scaling to the load
+regional_unit_mva = [20.0, 150.0]
+fleet_loading = [0.5, 0.8]    # total dispatch / total capacity
+rated_power_factor = 0.85
+loss_allowance = 0.03         # dispatch = load x (1 + loss_allowance)
+backbone_vm_pu = [1.03, 1.045]   # voltage setpoints (pu)
+regional_vm_pu = [1.02, 1.035]
+
+[compensation]
+capacitor_share = 0.8         # capacitor covers this share of a bus's load Q
+reactor_share = 0.75          # reactor absorbs this share of the line charging at a bus
+min_mvar = 1.0                # smaller net compensation is not modelled
+
+[planning]                    # DC-power-flow reinforcement
+dc_loading_target = 0.7       # single circuit: max share of the rating
+n1_corridor_loading = 0.9     # several circuits: max share after losing one
