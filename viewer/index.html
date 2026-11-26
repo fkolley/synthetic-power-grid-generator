@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Grid Viewer · CIM / CGMES</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha384-sHL9NAb7lN7rfvG5lfHpm643Xkcjzp4jFvuavGOndn6pjVqS6ny56CAt3nsEVT4H" crossorigin="anonymous">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="no-model">
+  <header id="toolbar">
+    <div class="brand"><span class="bolt">⚡</span> Grid Viewer <span class="sub">CIM · CGMES</span></div>
+
+    <div class="segmented" id="viewSwitch" role="tablist" aria-label="View">
+      <button data-view="geo" class="active" role="tab" title="Physical representation on a map (GL profile)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s7-6.2 7-12a7 7 0 1 0-14 0c0 5.8 7 12 7 12z"/><circle cx="12" cy="10" r="2.5"/></svg>Geographic</button>
+      <button data-view="sld" role="tab" title="Schematic single-line diagram (DL profile)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h7M14 6h7M12 6v12M5 18h14M7 6v-3M17 6v-3"/></svg>Schematic</button>
+    </div>
+
+    <label class="field">Colour
+      <select id="colorMode">
+        <option value="voltage">Voltage level</option>
+        <option value="loading">Branch loading</option>
+        <option value="vpu">Bus voltage (pu)</option>
+      </select>
+    </label>
+
+    <label class="field" id="basemapField">Map
+      <select id="basemap">
+        <option value="dark">Dark</option>
+        <option value="light">Light</option>
+        <option value="osm">OpenStreetMap</option>
+        <option value="satellite">Satellite</option>
+        <option value="none">None</option>
+      </select>
+    </label>
+
+    <label class="toggle"><input type="checkbox" id="animFlows" checked> Flows</label>
+    <label class="toggle"><input type="checkbox" id="showLabels"> Labels</label>
+    <label class="toggle"><input type="checkbox" id="showEquipment" checked> Equipment</label>
+
+    <div class="search">
+      <input id="search" list="searchList" placeholder="Search substation, line, unit…" autocomplete="off">
+      <datalist id="searchList"></datalist>
+    </div>
+
+    <button id="openBtn" class="primary">Open files…</button>
+    <input type="file" id="fileInput" multiple accept=".zip,.xml,.rdf" hidden>
+  </header>
+
+  <main>
+    <div id="geoMap" class="map"></div>
+    <div id="sldMap" class="map hidden"></div>
+
+    <aside id="panel">
+      <section id="summary"></section>
+      <section id="details" class="hidden"></section>
+      <section id="legend"></section>
+    </aside>
+
+    <div id="welcome">
+      <div class="card">
+        <div class="hero">⚡</div>
+        <h1>Grid Viewer</h1>
+        <p>Drop CGMES (<code>.zip</code> or profile <code>.xml</code> files) or a CIM17 RDF/XML file here,
+           or open them with the button. Everything runs locally in your browser.</p>
+        <div class="actions">
+          <button id="openBtn2" class="primary">Open files…</button>
+          <button data-sample="../synthetic_grid_CGMES.zip">Sample: CGMES zip</button>
+          <button data-sample="../synthetic_grid.cim.xml">Sample: CIM17 XML</button>
+        </div>
+        <p class="hint">Samples load when the repository root is served over HTTP, e.g.
+          <code>python -m http.server</code> and <code>http://localhost:8000/viewer/</code>.</p>
+      </div>
+    </div>
+
+    <div id="drop"><div>Drop CIM / CGMES files</div></div>
+    <div id="toast" class="hidden"></div>
+    <div id="busy" class="hidden"><div class="spinner"></div><span>Loading…</span></div>
+  </main>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha384-cxOPjt7s7Iz04uaHJceBmS+qpjv2JkIHNVcuOrM+YHwZOmJGBXI00mdUXEq65HTH" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"
+          integrity="sha384-+mbV2IY1Zk/X1p/nWllGySJSUN8uMs+gUAN10Or95UBH0fpj6GfKgPmgC5EXieXG" crossorigin="anonymous"></script>
+  <script src="cim.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
