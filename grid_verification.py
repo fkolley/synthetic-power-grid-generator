@@ -278,8 +278,64 @@ def run_power_flow(model: GraphModel, frequency_hz: float) -> Tuple[bool, List[s
     return ok, lines
 
 
-def verify_cim17(filename: str, expected_counts: Dict[str, int], frequency_hz: float) -> bool:
-    """Read the CIM17 file back with cim-graph and check it object by object."""
+def run_n1_analysis(model: GraphModel, frequency_hz: float) -> Optional[Dict]:
+    """N-1 contingency analysis: take each line and transformer out of service in turn
+    and re-solve the AC power flow. Returns None if pandapower is missing, else
+    {"total": n, "secure": n, "cases": [...]} where each case lists the outaged element
+    and its violations: non-convergence, islanded buses, voltages outside the
+    VoltageLevel limits and branches above 100 % loading. The base case must converge."""
+    if _import_pandapower() is None:
+        return None
+    net, maps = build_pandapower(model, frequency_hz)
+    if _runpp(net):
+        return None
+    vlim = maps["vlim"]
+    cases = []
+    for table, label in (("line", "line"), ("trafo", "transformer")):
+        for idx in list(net[table].index):
+            net[table].at[idx, "in_service"] = False
+            case = {"element": f"{label} {net[table].at[idx, 'name']}", "violations": []}
+            err = _runpp(net)
+            if err:
+                case["violations"].append(err)
+            else:
+                vm = net.res_bus.vm_pu
+                islanded = int(vm.isna().sum())
+                if islanded:
+                    case["violations"].append(f"{islanded} bus(es) islanded")
+                bad = [b for b in net.bus.index if not math.isnan(vm.at[b]) and not vlim[b][0] <= vm.at[b] <= vlim[b][1]]
+                if bad:
+                    case["violations"].append(f"{len(bad)} bus(es) outside voltage limits "
+                                              f"(worst {max(abs(vm.at[b] - 1) for b in bad):.3f} pu from 1.0)")
+                for res_label, res in (("line", net.res_line), ("transformer", net.res_trafo)):
+                    loading = res.loading_percent.dropna()
+                    over = loading[loading > 100]
+                    if len(over):
+                        case["violations"].append(f"{len(over)} {res_label}(s) overloaded "
+                                                  f"(max {over.max():.0f} %)")
+            net[table].at[idx, "in_service"] = True
+            cases.append(case)
+    secure = sum(1 for c in cases if not c["violations"])
+    return {"total": len(cases), "secure": secure, "cases": cases}
+
+
+def print_n1_report(result: Optional[Dict], max_listed: int = 5) -> None:
+    """Print the N-1 summary. Informational only: violations do not fail the run."""
+    if result is None:
+        print("  N-1 contingencies: skipped (pandapower not installed or base case did not converge)")
+        return
+    print(f"  N-1 contingencies: {result['secure']} of {result['total']} outages without violations")
+    insecure = [c for c in result["cases"] if c["violations"]]
+    for c in insecure[:max_listed]:
+        print(f"    {c['element']} out: {'; '.join(c['violations'])}")
+    if len(insecure) > max_listed:
+        print(f"    ... and {len(insecure) - max_listed} more")
+
+
+def verify_cim17(filename: str, expected_counts: Dict[str, int], frequency_hz: float,
+                 n1: bool = True) -> bool:
+    """Read the CIM17 file back with cim-graph and check it object by object.
+    With n1, an N-1 contingency report is added; it is informational and never fails the run."""
     ok = True
     model = NodeBreakerModel(container=None, connection=XMLFile(filename=filename))
     counts = {cls.__name__: len(objs) for cls, objs in model.graph.items() if objs}
@@ -309,6 +365,8 @@ def verify_cim17(filename: str, expected_counts: Dict[str, int], frequency_hz: f
     print(f"  AC power flow: {pf_lines[0]}")
     for line in pf_lines[1:]:
         print(f"    {line}")
+    if n1 and pf_ok:
+        print_n1_report(run_n1_analysis(model, frequency_hz))
     return ok and pf_ok
 
 

@@ -52,6 +52,9 @@ models on a map or as a single-line diagram.
 - Model checks: connectivity, wiring, containers, limits, a single slack and generator
   dispatch within limits.
 - AC power flow with pandapower: convergence, voltages within limits, no overloaded branches.
+- N-1 contingency report: every line and transformer is taken out in turn and the AC power
+  flow re-solved, listing overloads, voltage violations and islanded buses. Informational
+  only (it does not fail the run); skip it with `--skip-n1`.
 - The CGMES zip is imported into PowSyBl, the reference open-source CGMES importer, and
   solved with its own AC load flow. The resulting voltages are compared with the SV profile.
 - The script exits with a non-zero status if any check fails.
@@ -84,6 +87,10 @@ Verification (CIM17):
     380 kV: V=[1.034, 1.041] pu (392.9-395.6 kV)
     lines: max loading 68 %
     transformers: max loading 34 %
+  N-1 contingencies: 77 of 80 outages without violations
+    line Line_110kV_019_038_C1 out: 1 line(s) overloaded (max 119 %)
+    line Line_110kV_002_027_C1 out: 1 line(s) overloaded (max 122 %)
+    line Line_110kV_007_027_C1 out: 3 bus(es) islanded
 Wrote CGMES 2.4.15 → synthetic_grid_CGMES.zip (137895 bytes): EQ, TP, SSH, SV, GL, DL
 Verification (CGMES):
   PowSyBl import: OK (45 TopologicalNode, 70 ACLineSegment, 10 PowerTransformer, 8 SynchronousMachine, 30 EnergyConsumer, 34 LinearShuntCompensator)
@@ -114,6 +121,7 @@ python synthetic_cim_generator.py --backbone-voltage 220
 | `--backbone-voltage` | 380 | Backbone nominal voltage in kV |
 | `--backbone-buses` | buses / 8 | Substations with a backbone bus; `0` for a single-level grid |
 | `--seed` | 42 | Random seed |
+| `--skip-n1` | off | Skip the N-1 contingency report |
 | `--format` | `both` | `cim17`, `cgmes` or `both` |
 | `--output` | `synthetic_grid.cim.xml` | CIM17 output path |
 | `--cgmes-output` | `<output stem>_CGMES.zip` | CGMES output path |
@@ -171,6 +179,8 @@ corresponding checks are skipped.
 
 - The 110 kV voltage depends on the 380 kV level, because the transformers have no
   on-load tap changers.
+- The grid is not made N-1 secure: the reinforcement only targets the intact network, so the
+  N-1 report can show overloads and islanded buses.
 - There are no loads or generators at 220 kV, no HVDC, and no renewable generation profiles.
 - The output has not been checked against the official ENTSO-E CGMES conformity rules.
   It is validated by importing it into PowSyBl.
