@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .venv/
+# generated outputs
+*.cim.xml
+*_CGMES.zip
