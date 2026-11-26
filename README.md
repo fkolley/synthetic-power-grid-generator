@@ -126,8 +126,55 @@ python synthetic_cim_generator.py --backbone-voltage 220
 | `--output` | `synthetic_grid.cim.xml` | CIM17 output path |
 | `--cgmes-output` | `<output stem>_CGMES.zip` | CGMES output path |
 
-Grids from a few buses up to several hundred substations have been tested. A
-400-substation grid takes about 30 seconds including all verification.
+Grids from a few buses up to several hundred substations have been tested. Most of the
+runtime is verification, and the N-1 report is the largest part of it. With
+`--format cim17`, a 400-substation grid takes about 2 minutes, or about 25 seconds with
+`--skip-n1`.
+
+## N-1 contingency analysis
+
+The CIM17 verification ends with an N-1 report. It shows how the generated grid copes
+when any single line circuit or transformer fails.
+
+**How it works**
+- The analysis runs on the CIM17 file as read back from disk, so it tests exactly what
+  was written.
+- Each line circuit (`ACLineSegment`) and each transformer is taken out of service in turn,
+  and the AC power flow (pandapower) is solved again. Parallel circuits and parallel
+  transformers count as separate outages.
+- Generator dispatch and voltage setpoints stay as in the base case; the slack covers
+  any change in losses. There is no redispatch or other remedial action.
+- Each outage is checked for:
+  - a power flow that does not converge,
+  - islanded buses: part of the grid is cut off, and its load is not supplied,
+  - bus voltages outside the voltage level's limits,
+  - lines or transformers above 100 % of their thermal rating (`PATL`).
+
+**Reading the report**
+```
+  N-1 contingencies: 77 of 80 outages without violations
+    line Line_110kV_019_038_C1 out: 1 line(s) overloaded (max 119 %)
+    line Line_110kV_002_027_C1 out: 1 line(s) overloaded (max 122 %)
+    line Line_110kV_007_027_C1 out: 3 bus(es) islanded
+```
+The first line counts the outages with no violations. Each following line names the
+element taken out and what went wrong. Up to five outages are listed; the rest are
+summarised as "… and N more".
+
+**What it means for the generated grids**
+- The report is informational: violations do not change the exit status. It is skipped
+  with `--skip-n1`, and when the base case already fails its power-flow check
+  (no convergence, a voltage outside its limits, or an overload).
+- The generator does not make grids N-1 secure. It does apply two N-1-minded design
+  rules: every backbone site has at least two 380/110 kV transformers, and every
+  substation is connected by at least two lines.
+- Even so, outages can island buses. A group of substations can be well meshed inside
+  but attached to the rest of the grid by a single line; losing that line cuts the
+  whole group off.
+- Overloads appear because reinforcement only considers the intact network.
+- Typical results: 77 of 80 outages without violations for the default grid, 395 of 401
+  for 200 substations, and 782 of 798 for 400 substations.
+- The analysis covers the CIM17 model only. With `--format cgmes` there is no N-1 report.
 
 ## Viewing the grid
 
