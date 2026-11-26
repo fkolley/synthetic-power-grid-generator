@@ -21,9 +21,15 @@
 # four-circuit lines and no 110 kV lines between grid groups. 220 kV is not modelled
 # separately; the 380 kV level stands for the whole transmission grid.
 #
-# Resources: planning takes about 20 s. Writing and verifying the full model takes
-# much longer and several GB of memory (about 250,000 CIM objects). The N-1 report
-# is off, because it would take hours for about 10,000 circuits.
+# Resources (measured on one machine; about 223,000 CIM objects):
+#   planning 17 s, CIM objects 12 s, AC power flow for the SV profile about 2 min,
+#   about 0.8 GB of memory up to that point.
+# Writing the files and verifying them (pandapower check, PowSyBl import) needs
+# considerably more memory; plan for at least 4 GB free. A complete run has not yet
+# been tested end to end: on a 3.8 GB machine the process ran out of memory after the
+# power flow. The output is therefore CGMES only, which avoids reading the whole CIM17
+# file back for verification; use format = "both" on a machine with more memory.
+# The N-1 report is off: it would take hours for about 10,000 circuits.
 
 [grid]
 buses = 4000                  # 110 kV substations
@@ -35,7 +41,7 @@ backbone_buses = 350          # 380/110 kV supply points
 seed = 2026
 
 [output]
-format = "both"
+format = "cgmes"              # "both" needs considerably more memory (see above)
 cim17 = "germany_hv_ehv.cim.xml"
 cgmes = "germany_hv_ehv_CGMES.zip"
 n1_report = false             # hours at this size

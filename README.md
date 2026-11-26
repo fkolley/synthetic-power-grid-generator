@@ -155,7 +155,7 @@ templates:
 | File | Grid |
 |---|---|
 | [params/small_grid.toml](params/small_grid.toml) | 15 substations at 110 kV with two 380 kV supply points. Runs in seconds; for tests, demos and teaching. |
-| [params/germany_hv_ehv.toml](params/germany_hv_ehv.toml) | Germany-scale grid: 4,000 substations at 110 kV, 350 supply points at 380 kV, the area of Germany, 220/380 kV circuit length of about 37,000 km and about 74 GW of load. The file compares the model with national figures. |
+| [params/germany_hv_ehv.toml](params/germany_hv_ehv.toml) | Germany-scale grid: 4,000 substations at 110 kV, 350 supply points at 380 kV, the area of Germany, 220/380 kV circuit length of about 37,000 km and about 74 GW of load. The file compares the model with national figures. Needs several GB of memory; see the notes in the file. |
 
 The file is organised in sections:
 
