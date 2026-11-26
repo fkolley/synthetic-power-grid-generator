@@ -1,0 +1,4 @@
+cim-graph>=0.6
+networkx>=3.0
+# optional: AC power-flow verification
+pandapower>=3.0
