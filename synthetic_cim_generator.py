@@ -14,7 +14,7 @@ PowSyBl (pypowsybl), the reference open-source CGMES importer.
 
 Usage:
     python synthetic_cim_generator.py                       # 40 substations, 380/110 kV
-    python synthetic_cim_generator.py --buses 200 --gens 30 --loads 150 --seed 7
+    python synthetic_cim_generator.py --buses 200 --gens 30 --seed 7
     python synthetic_cim_generator.py --buses 12 --backbone-buses 0 --format cim17
 
 Model contents:
@@ -29,16 +29,22 @@ Model contents:
     GL: Location + PositionPoint (WGS84) for substations and line routes
     DL: Diagram with DiagramObjects for buses, lines, transformers, machines, loads, shunts
 
-Network design:
-    * 110 kV regional grid: random substation sites, minimum spanning tree plus
-      nearest-neighbour corridors; line length follows distance.
-    * 380 kV backbone: a subset of sites spread over the area, meshed the same way,
-      each coupled to the 110 kV grid by 300 MVA 380/110 kV transformers (at least
-      two per site for N-1, more if the site's supply area needs it).
-    * Large units connect to 380 kV, smaller units to 110 kV; loads are at 110 kV.
-      Dispatch equals load plus a loss allowance, shared in proportion to capacity.
-    * DC-power-flow reinforcement adds parallel circuits / transformers until no
-      branch exceeds 70 % of its rating.
+Network design (details: docs/topology.md, decisions: docs/topology-decisions.md):
+    * Substation sites cluster around towns (Thomas cluster process) with a rural
+      background; urban substations carry more load.
+    * 380 kV backbone: a subset of sites spread over the area, meshed, each coupled to
+      the 110 kV grid by 300 MVA 380/110 kV transformers (at least two per site).
+    * 110 kV: separate grid groups (Netzgruppen) of one or two 380/110 kV supply
+      points each; within a group a spanning tree, closed into rings of 5-20
+      substations (no triangles, no crossings, rings through supply points preferred),
+      with short stubs (Stichleitungen) of at most two substations.
+    * All corridors are double-circuit lines (two systems per tower).
+    * Every 110 kV substation has a load by default; stub ends always do.
+    * Large units connect to 380 kV, smaller units to 110 kV. Dispatch equals load
+      plus a loss allowance, shared in proportion to capacity.
+    * DC-power-flow reinforcement adds circuits / transformers until single circuits
+      stay below 70 % of their rating and multi-circuit corridors survive the loss
+      of one circuit at <= 90 %.
     * Per-bus shunt compensation: capacitors for load Q, reactors for line charging.
 
 German / European defaults:
@@ -134,12 +140,29 @@ def voltage_limits_pu(voltage_kv: float) -> Tuple[float, float]:
     return 0.90, 1.118
 
 
-# Network sizing
-SPACING_KM_110 = 12.0          # distance between neighbouring 110 kV substations
-AVG_DEGREE = 2.8               # 2 x lines / buses, 110 kV grid
-BACKBONE_AVG_DEGREE = 2.8      # 2 x lines / buses, 380 kV grid
+# Network sizing and topology (see docs/topology.md and docs/topology-decisions.md)
+SPACING_KM_110 = 12.0          # typical distance between neighbouring 110 kV substations
+BACKBONE_AVG_DEGREE = 2.8      # 2 x corridors / buses, 380 kV (meshed transmission grid)
 BUSES_PER_BACKBONE_SITE = 8    # default --backbone-buses = buses / this
 ROUTING_FACTOR = 1.15          # line length / straight-line distance
+
+# Site placement: substations cluster around towns (Thomas cluster process) plus a rural background
+URBAN_SHARE = 0.6              # share of substations drawn around town centres
+SITES_PER_TOWN = 15            # number of town centres = buses / this
+TOWN_SIGMA = 1.6               # town radius in units of SPACING_KM_110 (scaled with town weight)
+MIN_SITE_SEPARATION = 0.35     # minimum distance between substations, in units of SPACING_KM_110
+LOAD_FACTOR = {"urban": 1.3, "rural": 0.75}   # load of urban / rural substations relative to LOAD_MW_RANGE
+
+# 110 kV: ring-and-stub grid groups (Netzgruppen) fed from 380/110 kV supply points
+AVG_DEGREE_110 = 2.4           # target 2 x corridors / substations within a group (corridors, not circuits)
+RING_SIZE = (5, 20)            # substations per ring created by a ring-closing corridor
+PREFERRED_MIN_RING = 6         # rings of 5 are allowed but penalised
+RING_LINK_MAX = 3.0            # max ring-closing corridor length / median tree corridor length
+STUB_LINK_MAX = 3.5            # same for corridors that close an overly long stub
+MAX_STUB_DEPTH = 2             # substations a stub (Stichleitung) may hang off the ring / supply point
+STUB_TIP_PENALTY = 0.35        # ring-closing score factor for corridors ending at a stub end
+LINE_CLEARANCE = 0.3           # a new corridor may not pass closer to another substation (x SPACING_KM_110)
+CIRCUITS_PER_CORRIDOR = 2      # double-circuit overhead lines (two systems per tower) as built in Germany
 
 # Loads and generation
 LOAD_MW_RANGE = (5.0, 45.0)    # per 110 kV substation (2-3 x 40 MVA 110/20 kV transformers)
@@ -167,16 +190,39 @@ def default_backbone_buses(n_buses: int) -> int:
     return n if n >= 2 else 0
 
 
-def random_sites(n: int, spacing_km: float, rng: random.Random) -> List[Tuple[float, float]]:
+def clustered_sites(n: int, spacing_km: float, rng: random.Random) -> Tuple[List[Tuple[float, float]], List[str]]:
+    """Substation sites: a Thomas cluster process around town centres (town sizes
+    Pareto-distributed) plus a uniform rural background, with a minimum separation.
+    Returns the positions [km] and "urban" / "rural" per site."""
     side = spacing_km * math.sqrt(n) * 2.0
-    return [(rng.uniform(0, side), rng.uniform(0, side)) for _ in range(n)]
+    margin = 0.1 * side
+    n_towns = max(1, round(n / SITES_PER_TOWN))
+    towns = [(rng.uniform(margin, side - margin), rng.uniform(margin, side - margin), rng.paretovariate(1.5))
+             for _ in range(n_towns)]
+    mean_w = sum(t[2] for t in towns) / n_towns
+    min_sep = MIN_SITE_SEPARATION * spacing_km
+    pos: List[Tuple[float, float]] = []
+    kind: List[str] = []
+    while len(pos) < n:
+        for _attempt in range(60):
+            if rng.random() < URBAN_SHARE:
+                cx, cy, w = rng.choices(towns, weights=[t[2] for t in towns])[0]
+                sigma = spacing_km * TOWN_SIGMA * min(2.5, math.sqrt(w / mean_w))
+                p, k = (rng.gauss(cx, sigma), rng.gauss(cy, sigma)), "urban"
+            else:
+                p, k = (rng.uniform(0, side), rng.uniform(0, side)), "rural"
+            p = (min(side, max(0.0, p[0])), min(side, max(0.0, p[1])))
+            if all(math.dist(p, q) >= min_sep for q in pos):
+                break
+        pos.append(p)
+        kind.append(k)
+    return pos, kind
 
 
-def build_corridors(pos: Sequence[Tuple[float, float]], avg_degree: float) -> nx.Graph:
-    """Minimum spanning tree for connectivity, then the shortest remaining
-    nearest-neighbour corridors until the target average degree is reached (real
-    grids connect mostly to nearby buses). Edge attribute 'length_km' is the routed
-    line length."""
+def build_backbone_mesh(pos: Sequence[Tuple[float, float]], avg_degree: float) -> nx.Graph:
+    """380 kV: meshed transmission grid. Minimum spanning tree, then the shortest
+    remaining nearest-neighbour corridors up to the target degree, and no substation
+    with a single corridor. Edge attribute 'length_km' is the routed line length."""
     n = len(pos)
 
     def dist(a, b):
@@ -186,11 +232,8 @@ def build_corridors(pos: Sequence[Tuple[float, float]], avg_degree: float) -> nx
     G.add_nodes_from(range(n))
     if n < 2:
         return G
-    complete = nx.Graph()
-    complete.add_weighted_edges_from((a, b, dist(a, b)) for a in range(n) for b in range(a + 1, n))
-    G.add_edges_from(nx.minimum_spanning_tree(complete).edges())
-
-    k = 4  # candidate corridors: each bus to its k nearest neighbours
+    G.add_edges_from(_mst_edges(list(range(n)), pos))
+    k = 4  # candidate corridors: each site to its k nearest neighbours
     candidates = set()
     for a in range(n):
         for b in sorted((b for b in range(n) if b != a), key=lambda b: dist(a, b))[:k]:
@@ -201,16 +244,194 @@ def build_corridors(pos: Sequence[Tuple[float, float]], avg_degree: float) -> nx
         if G.number_of_edges() >= target_edges:
             break
         G.add_edge(a, b)
-    # No dead ends: every substation is fed from two sides (n-1), as is usual practice.
     if n >= 3:
         for a in range(n):
             if G.degree(a) < 2:
                 b = min((b for b in range(n) if b != a and not G.has_edge(a, b)), key=lambda b: dist(a, b))
                 G.add_edge(a, b)
-
     for a, b in G.edges():
         G.edges[a, b]["length_km"] = max(2.0, dist(a, b) * ROUTING_FACTOR)
     return G
+
+
+def _mst_edges(nodes: Sequence[int], pos) -> List[Tuple[int, int]]:
+    complete = nx.Graph()
+    complete.add_nodes_from(nodes)
+    complete.add_weighted_edges_from((a, b, math.dist(pos[a], pos[b]))
+                                     for i, a in enumerate(nodes) for b in nodes[i + 1:])
+    return list(nx.minimum_spanning_tree(complete).edges())
+
+
+def _segments_cross(p1, p2, p3, p4) -> bool:
+    """Proper intersection of segments p1-p2 and p3-p4 (shared end points do not count)."""
+    def orient(a, b, c):
+        v = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+        return (v > 1e-9) - (v < -1e-9)
+    if p1 in (p3, p4) or p2 in (p3, p4):
+        return False
+    return orient(p1, p2, p3) * orient(p1, p2, p4) < 0 and orient(p3, p4, p1) * orient(p3, p4, p2) < 0
+
+
+def _point_segment_distance(p, a, b) -> float:
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    t = max(0.0, min(1.0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (dx * dx + dy * dy or 1e-12)))
+    return math.dist(p, (a[0] + t * dx, a[1] + t * dy))
+
+
+def supply_groups(pos, bb_sites: List[int], bb_mesh: nx.Graph) -> List[List[int]]:
+    """Group the 380/110 kV supply points into grid groups (Netzgruppen) of one or two:
+    neighbouring supply points in the 380 kV grid are paired, shortest pairs first."""
+    if not bb_sites:
+        return [[]]
+    pairs = sorted(bb_mesh.edges(), key=lambda e: math.dist(pos[bb_sites[e[0]]], pos[bb_sites[e[1]]]))
+    paired, groups = set(), []
+    for a, b in pairs:
+        if a not in paired and b not in paired:
+            paired.update((a, b))
+            groups.append([bb_sites[a], bb_sites[b]])
+    groups += [[bb_sites[j]] for j in range(len(bb_sites)) if j not in paired]
+    return groups
+
+
+def build_regional_grid(pos, groups: List[List[int]], leaf_budget: int, spacing_km: float,
+                        stats: Optional[Dict] = None) -> Tuple[nx.Graph, List[int]]:
+    """110 kV ring-and-stub topology, one grid group per entry in `groups`.
+
+    Every substation joins the group of its nearest supply point. Within each group:
+    a Euclidean minimum spanning tree, then ring-closing corridors chosen greedily
+    (rings of RING_SIZE substations, high detour ratio, short, no crossings, not past
+    other substations, rings through a supply point preferred) up to AVG_DEGREE_110;
+    stubs longer than MAX_STUB_DEPTH are closed into rings. Finally, if there are more
+    stub ends than loads, the deepest stub ends are closed as well. Groups are not
+    connected to each other at 110 kV. Returns the graph and the group of each node."""
+    n = len(pos)
+    supply_of = {s: gi for gi, g in enumerate(groups) for s in g}
+    supplies = [s for g in groups for s in g]
+    group_of = [supply_of[min(supplies, key=lambda s: math.dist(pos[i], pos[s]))] if supplies else 0
+                for i in range(n)]
+    members = [[i for i in range(n) if group_of[i] == gi] for gi in range(len(groups))]
+
+    G = nx.Graph()
+    G.add_nodes_from(range(n))
+    for nodes in members:
+        G.add_edges_from(_mst_edges(nodes, pos), kind="tree")
+    tree_lengths = sorted(math.dist(pos[a], pos[b]) for a, b in G.edges()) or [spacing_km]
+    l_med = tree_lengths[len(tree_lengths) // 2]
+    clearance = LINE_CLEARANCE * spacing_km
+    dist = lambda a, b: math.dist(pos[a], pos[b])  # noqa: E731
+
+    def geometry_ok(u, v) -> bool:
+        pu, pv = pos[u], pos[v]
+        for a, b in G.edges():
+            if _segments_cross(pu, pv, pos[a], pos[b]):
+                return False
+        return all(_point_segment_distance(pos[w], pu, pv) >= clearance for w in range(n) if w not in (u, v))
+
+    def close(nodes, sup, ring_size, link_max, sources=None, bonus_supply=True):
+        """Best ring-closing corridor for the given sources (all nodes if None), or None."""
+        H = G.subgraph(nodes)
+        best, best_score = None, 0.0
+        for u in (sources if sources is not None else nodes):
+            lengths, paths = nx.single_source_dijkstra(H, u, weight=lambda a, b, d: dist(a, b))
+            hops = nx.single_source_shortest_path_length(H, u)
+            for v in nodes:
+                if v == u or G.has_edge(u, v) or v not in paths:
+                    continue
+                d = dist(u, v)
+                if d > link_max * l_med:
+                    continue
+                ring = hops[v] + 1                   # substations on the smallest ring the corridor creates
+                if not ring_size[0] <= ring <= ring_size[1]:
+                    continue
+                score = (lengths[v] / max(d, 1e-6)) / (d / l_med)     # detour ratio, prefer short corridors
+                if ring < PREFERRED_MIN_RING:
+                    score *= 0.6
+                if bonus_supply and sup and any(s in paths[v] for s in sup):
+                    score *= 1.5                     # rings start and end at a supply point
+                if sources is None and (H.degree(u) == 1 or H.degree(v) == 1):
+                    score *= STUB_TIP_PENALTY        # keep stubs: rings through inner substations
+                if score > best_score and geometry_ok(u, v):
+                    best, best_score = (u, v), score
+        return best
+
+    def stub_depths(nodes, sup):
+        H = G.subgraph(nodes)
+        bridges = set(map(frozenset, nx.bridges(H))) if H.number_of_edges() else set()
+        core = {x for e in H.edges() if frozenset(e) not in bridges for x in e} | set(sup)
+        if not core:
+            core = {max(nodes, key=H.degree)}
+        return {v: d for v, d in nx.multi_source_dijkstra_path_length(H, core, weight=lambda *_: 1).items()}
+
+    added = {"ring": 0, "stub": 0, "leaf": 0}
+    for gi, nodes in enumerate(members):
+        sup = groups[gi]
+        if len(nodes) < RING_SIZE[0]:
+            continue
+        target = max(len(nodes) - 1, round(AVG_DEGREE_110 * len(nodes) / 2))
+        while G.subgraph(nodes).number_of_edges() < target:
+            e = close(nodes, sup, RING_SIZE, RING_LINK_MAX)
+            if e is None:
+                break
+            G.add_edge(*e, kind="ring")
+            added["ring"] += 1
+        # Stubs may hang at most MAX_STUB_DEPTH substations off the ring / supply point
+        for _ in range(len(nodes)):
+            depth = stub_depths(nodes, sup)
+            deep = [v for v, d in depth.items() if d > MAX_STUB_DEPTH and G.degree(v) == 1]
+            if not deep:
+                break
+            tip = max(deep, key=lambda v: depth[v])
+            e = close(nodes, sup, (4, RING_SIZE[1] + 5), STUB_LINK_MAX, sources=[tip], bonus_supply=False)
+            if e is None:
+                break
+            G.add_edge(*e, kind="ring")
+            added["stub"] += 1
+
+    # Every stub end needs a load: close the deepest stub ends if there are not enough loads
+    for _ in range(n):
+        leaves = [v for v in range(n) if G.degree(v) == 1 and v not in supply_of]
+        if len(leaves) <= leaf_budget:
+            break
+        gi_depth = {}
+        for v in leaves:
+            gi = group_of[v]
+            if gi not in gi_depth:
+                gi_depth[gi] = stub_depths(members[gi], groups[gi])
+        tip = max(leaves, key=lambda v: gi_depth[group_of[v]].get(v, 0))
+        nodes = members[group_of[tip]]
+        e = (close(nodes, groups[group_of[tip]], (4, n), STUB_LINK_MAX, sources=[tip], bonus_supply=False)
+             or close(nodes, groups[group_of[tip]], (3, n), float("inf"), sources=[tip], bonus_supply=False))
+        if e is None:
+            break
+        G.add_edge(*e, kind="ring")
+        added["leaf"] += 1
+
+    for a, b in G.edges():
+        G.edges[a, b]["length_km"] = max(2.0, dist(a, b) * ROUTING_FACTOR)
+    if stats is not None:
+        stats.update(added)
+    return G, group_of
+
+
+def topology_metrics(G: nx.Graph, group_of: Sequence[int], supplies: Sequence[int]) -> Dict:
+    """Structural statistics of the 110 kV corridor graph (corridors, not circuits)."""
+    n = G.number_of_nodes()
+    deg = [d for _, d in G.degree()]
+    cycles = sorted(len(c) for c in nx.minimum_cycle_basis(G)) if G.number_of_edges() else []
+    lengths = sorted(d["length_km"] for *_, d in G.edges(data=True)) or [0.0]
+    supply = set(supplies)
+    leaves = [v for v in G.nodes if G.degree(v) == 1 and v not in supply]
+    return {
+        "groups": len(set(group_of)),
+        "corridors": G.number_of_edges(),
+        "avg_degree": sum(deg) / n if n else 0.0,
+        "leaf_share": len(leaves) / n if n else 0.0,
+        "triangles": sum(nx.triangles(G).values()) // 3,
+        "clustering": nx.average_clustering(G) if n else 0.0,
+        "rings": len(cycles),
+        "ring_size": (cycles[0], cycles[len(cycles) // 2], cycles[-1]) if cycles else None,
+        "length_km": (lengths[len(lengths) // 2], lengths[int(0.95 * (len(lengths) - 1))]),
+    }
 
 
 def spread_sites(pos: Sequence[Tuple[float, float]], n: int, rng: random.Random) -> List[int]:
@@ -224,15 +445,18 @@ def spread_sites(pos: Sequence[Tuple[float, float]], n: int, rng: random.Random)
     return chosen
 
 
-def place_generators(G: nx.Graph, n_gens: int, rng: random.Random) -> List[int]:
+def place_generators(G: nx.Graph, n_gens: int, rng: random.Random,
+                     candidates: Optional[List[int]] = None) -> List[int]:
     """Spread generators over a network: randomised farthest-point sampling on hop
-    distance, so every bus has a generator within a few lines."""
+    distance, so every bus has a generator within a few lines. Only `candidates`
+    (default: all nodes) can receive a generator."""
     if n_gens == 0:
         return []
+    pool = sorted(candidates if candidates is not None else G.nodes)
     hops = dict(nx.all_pairs_shortest_path_length(G))
-    chosen = [rng.choice(sorted(G.nodes))]
+    chosen = [rng.choice(pool)]
     while len(chosen) < n_gens:
-        remaining = [b for b in sorted(G.nodes) if b not in chosen]
+        remaining = [b for b in pool if b not in chosen]
         far = {b: min(hops[b][c] for c in chosen) for b in remaining}
         best = max(far.values())
         chosen.append(rng.choice([b for b in remaining if far[b] >= best - 1]))
@@ -299,7 +523,8 @@ class Gen:
 
 
 S_BASE_MVA = 100.0
-DC_LOADING_TARGET = 0.7        # reinforce until DC flows are below this share of the rating
+DC_LOADING_TARGET = 0.7        # single circuit: reinforce until the DC flow is below this share of the rating
+N1_CORRIDOR_LOADING = 0.9      # several circuits: after losing one, the others carry at most this share
 MAX_LINE_CIRCUITS = 4
 MAX_TRANSFORMERS_PER_SITE = 8
 
@@ -321,14 +546,22 @@ def dc_flows(n_bus: int, branches: List[Branch], injection_mw: Sequence[float], 
 
 
 def reinforce(n_bus: int, branches: List[Branch], injection_mw: Sequence[float], slack_bus: int) -> int:
-    """Add parallel circuits / transformers until no branch exceeds DC_LOADING_TARGET.
-    Returns the number of units added."""
+    """Add parallel circuits / transformers until every branch is within its planning
+    limit. Single circuits: DC flow at most DC_LOADING_TARGET of the rating. Several
+    parallel circuits or transformers: if one of them fails, the others still carry
+    the flow at no more than N1_CORRIDOR_LOADING of their rating (N-1 within the
+    corridor). Returns the number of units added."""
+    def limit(br: Branch) -> float:
+        if br.circuits >= 2:
+            return N1_CORRIDOR_LOADING * br.rating_mva * (br.circuits - 1)
+        return DC_LOADING_TARGET * br.rating_mva
+
     added = 0
     for _ in range(50):
         flows = dc_flows(n_bus, branches, injection_mw, slack_bus)
         changed = False
         for br, f in zip(branches, flows):
-            if abs(f) > DC_LOADING_TARGET * br.rating_mva * br.circuits and br.circuits < br.max_circuits:
+            if abs(f) > limit(br) and br.circuits < br.max_circuits:
                 br.circuits += 1
                 added += 1
                 changed = True
@@ -350,12 +583,14 @@ class Plan:
     branches: List[Branch]
     loads: List[Tuple[int, float, float]]
     gens: List[Gen]
+    group_of: List[int] = None       # 110 kV grid group of each substation
+    metrics: Dict = None             # 110 kV topology statistics (topology_metrics)
 
 
 def plan_network(
     n_buses: int = 40,
     n_gens: int = 8,
-    n_loads: int = 30,
+    n_loads: Optional[int] = None,
     voltage_kv: float = DEFAULT_VOLTAGE_KV,
     backbone_kv: float = DEFAULT_BACKBONE_KV,
     n_backbone: Optional[int] = None,
@@ -365,19 +600,25 @@ def plan_network(
 
     n_buses is the number of lower-level (110 kV) buses, one per substation.
     n_backbone of those substations also get a backbone (380 kV) bus; None picks
-    a default from n_buses, 0 builds a single-level grid.
+    a default from n_buses, 0 builds a single-level grid. n_loads None puts a load
+    on every lower-level substation.
     """
     if n_backbone is None:
         n_backbone = default_backbone_buses(n_buses)
+    if n_loads is None:
+        n_loads = n_buses
     validate_sizes(n_buses, n_gens, n_loads, n_backbone, voltage_kv, backbone_kv)
     rng = random.Random(seed)
+    spacing = SPACING_KM_110 * voltage_kv / 110.0
 
-    # --- Geography: 110 kV sites, backbone sites, corridors ----------------------
-    pos = random_sites(n_buses, SPACING_KM_110 * voltage_kv / 110.0, rng)
-    G_lv = build_corridors(pos, AVG_DEGREE)
+    # --- Geography: clustered sites, 380 kV mesh, 110 kV ring-and-stub grid groups ---
+    pos, site_kind = clustered_sites(n_buses, spacing, rng)
     bb_sites = spread_sites(pos, n_backbone, rng) if n_backbone else []
-    G_bb = nx.relabel_nodes(build_corridors([pos[s] for s in bb_sites], BACKBONE_AVG_DEGREE),
-                            {j: n_buses + j for j in range(n_backbone)})
+    bb_mesh = build_backbone_mesh([pos[s] for s in bb_sites], BACKBONE_AVG_DEGREE)
+    G_bb = nx.relabel_nodes(bb_mesh, {j: n_buses + j for j in range(n_backbone)})
+    groups = supply_groups(pos, bb_sites, bb_mesh)
+    G_lv, group_of = build_regional_grid(pos, groups, leaf_budget=n_loads, spacing_km=spacing)
+    metrics = topology_metrics(G_lv, group_of, bb_sites)
     # Global bus index: 0..n_buses-1 lower level, n_buses.. backbone
     bus_kv = [voltage_kv] * n_buses + [backbone_kv] * n_backbone
     bus_site = list(range(n_buses)) + bb_sites
@@ -393,7 +634,8 @@ def plan_network(
             branches.append(Branch(
                 "line", u, v, x_pu=x / (kv**2 / S_BASE_MVA),
                 rating_mva=math.sqrt(3) * kv * line_type(kv).i_th_a / 1000,
-                max_circuits=MAX_LINE_CIRCUITS, length_km=length_km, r_ohm=r, x_ohm=x, bch_s=bch))
+                max_circuits=MAX_LINE_CIRCUITS, circuits=CIRCUITS_PER_CORRIDOR,
+                length_km=length_km, r_ohm=r, x_ohm=x, bch_s=bch))
 
     # --- Bus assignment ------------------------------------------------------------
     n_bb_gens = 0
@@ -402,18 +644,28 @@ def plan_network(
     n_lv_gens = n_gens - n_bb_gens
     if n_lv_gens > n_buses:
         n_bb_gens, n_lv_gens = n_gens - n_buses, n_buses
-    gen_buses = place_generators(G_bb, n_bb_gens, rng) + place_generators(G_lv, n_lv_gens, rng)
-    # Loads at 110 kV; prefer buses without a generator, fall back to generator buses.
+    # Hop distances for spreading regional units over the whole system: the 110 kV grid
+    # groups are only connected through the transformers and the 380 kV grid
+    G_all = nx.union(G_lv, G_bb)
+    G_all.add_edges_from((n_buses + j, s) for j, s in enumerate(bb_sites))
+    gen_buses = (place_generators(G_bb, n_bb_gens, rng)
+                 + place_generators(G_all, n_lv_gens, rng, candidates=list(range(n_buses))))
+    # Loads at 110 kV: stub ends first (a stub always ends at a load), then substations
+    # without a generator, then generator substations.
     lv_gen_buses = [b for b in gen_buses if b < n_buses]
-    free = [i for i in range(n_buses) if i not in lv_gen_buses]
-    rng.shuffle(free)
-    load_buses = (free + rng.sample(lv_gen_buses, len(lv_gen_buses)))[:n_loads]
+    supply = set(bb_sites)
+    leaves = [i for i in range(n_buses) if G_lv.degree(i) == 1 and i not in supply]
+    others = [i for i in range(n_buses) if i not in leaves and i not in lv_gen_buses]
+    rng.shuffle(leaves)
+    rng.shuffle(others)
+    rest = [i for i in lv_gen_buses if i not in leaves]
+    load_buses = (leaves + others + rng.sample(rest, len(rest)))[:n_loads]
 
     # --- Loads ---------------------------------------------------------------------
     load_scale = (voltage_kv / 110.0) ** 1.5
     loads: List[Tuple[int, float, float]] = []
     for bus_i in load_buses:
-        p_mw = round(rng.uniform(*LOAD_MW_RANGE) * load_scale, 2)
+        p_mw = round(rng.uniform(*LOAD_MW_RANGE) * load_scale * LOAD_FACTOR[site_kind[bus_i]], 2)
         loads.append((bus_i, p_mw, round(p_mw * rng.uniform(*LOAD_Q_RATIO), 2)))
     total_load_p = sum(p for _, p, _ in loads)
     total_load_q = sum(q for _, _, q in loads)
@@ -446,8 +698,9 @@ def plan_network(
         t = transformer_type(backbone_kv, voltage_kv)
         net_demand = [0.0] * n_backbone
         for i in range(n_buses):
-            j = min(range(n_backbone), key=lambda j: math.dist(pos[i], pos[bb_sites[j]]))
-            net_demand[j] -= injection[i]
+            # each substation is supplied by the nearest supply point of its own grid group
+            site = min(groups[group_of[i]], key=lambda s: math.dist(pos[i], pos[s]))
+            net_demand[bb_sites.index(site)] -= injection[i]
         x_pu = t.uk_percent / 100 * S_BASE_MVA / t.rated_s_mva
         for j, site in enumerate(bb_sites):
             count = max(MIN_TRANSFORMERS_PER_SITE,
@@ -458,7 +711,8 @@ def plan_network(
     # --- Reinforcement: parallel circuits / transformers where DC flows exceed ratings
     reinforce(n_total, branches, injection, gens[slack_idx].bus)
 
-    return Plan(seed, voltage_kv, backbone_kv, n_buses, bus_kv, bus_site, pos, branches, loads, gens)
+    return Plan(seed, voltage_kv, backbone_kv, n_buses, bus_kv, bus_site, pos, branches, loads, gens,
+                group_of=group_of, metrics=metrics)
 
 
 # ---------------------------------------------------------------------------
@@ -760,7 +1014,8 @@ def main():
                                                  "(German/European defaults)")
     parser.add_argument("--buses", type=int, default=40, help="Number of lower-level (110 kV) buses / substations")
     parser.add_argument("--gens", type=int, default=8, help="Number of generators")
-    parser.add_argument("--loads", type=int, default=30, help="Number of loads (at lower-level buses)")
+    parser.add_argument("--loads", type=int, default=None,
+                        help="Number of loads at lower-level buses (default: one per substation)")
     parser.add_argument("--voltage", type=float, default=DEFAULT_VOLTAGE_KV, help="Lower-level nominal voltage (kV)")
     parser.add_argument("--backbone-voltage", type=float, default=DEFAULT_BACKBONE_KV,
                         help="Backbone nominal voltage (kV)")
@@ -778,6 +1033,8 @@ def main():
     args = parser.parse_args()
 
     n_backbone = default_backbone_buses(args.buses) if args.backbone_buses is None else args.backbone_buses
+    if args.loads is None:
+        args.loads = args.buses
     try:
         validate_sizes(args.buses, args.gens, args.loads, n_backbone, args.voltage, args.backbone_voltage)
     except ValueError as e:
@@ -797,6 +1054,12 @@ def main():
     records = built.records.records
     counts = built.records.counts()
     print("Object counts:", counts)
+    t = plan.metrics
+    print(f"Topology {args.voltage:g} kV: {t['groups']} grid group(s), {t['corridors']} corridors "
+          f"({CIRCUITS_PER_CORRIDOR}+ circuits each), avg degree {t['avg_degree']:.2f}, "
+          f"stub ends {t['leaf_share']:.0%}, rings {t['rings']}"
+          + (f" (size {t['ring_size'][0]}-{t['ring_size'][2]}, median {t['ring_size'][1]})" if t['ring_size'] else "")
+          + f", triangles {t['triangles']}, clustering {t['clustering']:.2f}")
     if state is None:
         print("Note: no SV profile (pandapower missing or power flow did not converge)")
 
