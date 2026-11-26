@@ -231,3 +231,15 @@ corresponding checks are skipped.
 - There are no loads or generators at 220 kV, no HVDC, and no renewable generation profiles.
 - The output has not been checked against the official ENTSO-E CGMES conformity rules.
   It is validated by importing it into PowSyBl.
+
+## License
+
+Licensed under the [Business Source License 1.1](LICENSE) (BSL 1.1). This is not an
+open-source licence:
+
+- You may copy, modify and redistribute the code, and use it for non-production purposes
+  (development, testing, evaluation).
+- Production use requires a commercial licence from the Licensor (see [LICENSE](LICENSE)).
+  There is no Additional Use Grant.
+- On 2030-11-26, or four years after a version's first public release if that comes first,
+  the code converts to the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0).
